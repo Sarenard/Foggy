@@ -58,6 +58,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var map: MapView
     private lateinit var fogModeButton: Button
     private lateinit var trackingButton: Button
+    private lateinit var discoveredPercentText: TextView
     private lateinit var currentCityText: TextView
     private lateinit var locationHistoryDatabase: LocationHistoryDatabase
     private lateinit var savedPointsOverlay: SavedPointsOverlay
@@ -69,6 +70,7 @@ class MainActivity : AppCompatActivity() {
     private var hasCenteredOnGps = false
     private var lastResolvedCityName: String? = null
     private var lastLoadedCityBoundaryKey: String? = null
+    private var currentCityBoundary: CityBoundary? = null
     private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val pointsRefreshHandler = Handler(Looper.getMainLooper())
     private val pointsRefresher = object : Runnable {
@@ -91,6 +93,7 @@ class MainActivity : AppCompatActivity() {
         map = findViewById(R.id.map)
         fogModeButton = findViewById(R.id.fogModeButton)
         trackingButton = findViewById(R.id.trackingButton)
+        discoveredPercentText = findViewById(R.id.discoveredPercentText)
         currentCityText = findViewById(R.id.currentCityText)
         locationHistoryDatabase = LocationHistoryDatabase(applicationContext)
         savedPointsOverlay = SavedPointsOverlay()
@@ -202,6 +205,7 @@ class MainActivity : AppCompatActivity() {
         overlay.enableMyLocation()
         centerMapOnGpsWhenAvailable(overlay)
         updateCurrentCityFromLocation(overlay.myLocation)
+        updateDiscoveredPercentage()
         keepOverlayOrder()
         map.invalidate()
     }
@@ -222,6 +226,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 savedPointsOverlay.setPoints(points)
                 updateCurrentCityFromLocation(locationOverlay?.myLocation)
+                updateDiscoveredPercentage()
                 map.invalidate()
             }
         }
@@ -282,9 +287,11 @@ class MainActivity : AppCompatActivity() {
 
                 if (boundary != null) {
                     lastLoadedCityBoundaryKey = cityName
+                    currentCityBoundary = boundary
                     cityBoundaryOverlay.setPoints(boundary.outerRing)
                     cityBoundaryOverlay.setHoles(boundary.holes)
                     cityBoundaryOverlay.isVisible = true
+                    updateDiscoveredPercentage()
                     keepOverlayOrder()
                     map.invalidate()
                 }
@@ -406,9 +413,200 @@ class MainActivity : AppCompatActivity() {
         return points
     }
 
+    private fun updateDiscoveredPercentage() {
+        val boundary = currentCityBoundary ?: run {
+            discoveredPercentText.text = getString(R.string.discovered_percent_default)
+            return
+        }
+        val savedPoints = savedPointsOverlay.getPoints()
+        val currentLocation = locationOverlay?.myLocation
+
+        databaseExecutor.execute {
+            val revealCenters = buildList {
+                addAll(savedPoints.map { GeoPoint(it.latitude, it.longitude) })
+                if (currentLocation != null) {
+                    add(GeoPoint(currentLocation.latitude, currentLocation.longitude))
+                }
+            }
+
+            val percentage = computeDiscoveredPercentage(boundary, revealCenters)
+            val formattedPercentage = String.format(Locale.US, "%.3f%%", percentage)
+
+            runOnUiThread {
+                discoveredPercentText.text = formattedPercentage
+            }
+        }
+    }
+
+    private fun computeDiscoveredPercentage(
+        boundary: CityBoundary,
+        revealCenters: List<GeoPoint>
+    ): Double {
+        if (revealCenters.isEmpty()) return 0.0
+
+        val referencePoint = boundary.outerRing.firstOrNull() ?: return 0.0
+        val projectedBoundary = ProjectedBoundary(
+            outerRing = boundary.outerRing.map {
+                projectToMeters(it, referencePoint.latitude, referencePoint.longitude)
+            },
+            holes = boundary.holes.map { hole ->
+                hole.map { projectToMeters(it, referencePoint.latitude, referencePoint.longitude) }
+            }
+        )
+        val projectedRevealCenters = revealCenters.map {
+            projectToMeters(it, referencePoint.latitude, referencePoint.longitude)
+        }
+
+        val bounds = computeBounds(projectedBoundary.outerRing) ?: return 0.0
+        val polygonArea =
+            polygonArea(projectedBoundary.outerRing) -
+                projectedBoundary.holes.sumOf(::polygonArea)
+        if (polygonArea <= 0.0) return 0.0
+
+        val sampleSpacingMeters = determineSampleSpacingMeters(polygonArea)
+        val sampleOffset = sampleSpacingMeters / 2.0
+        val revealRadiusSquared = CLEAR_RADIUS_METERS * CLEAR_RADIUS_METERS
+        var insideSamples = 0
+        var discoveredSamples = 0
+        var y = bounds.minY
+
+        while (y <= bounds.maxY) {
+            var x = bounds.minX
+            while (x <= bounds.maxX) {
+                val sample = ProjectedPoint(
+                    x = x + sampleOffset,
+                    y = y + sampleOffset
+                )
+                if (isInsideBoundary(sample, projectedBoundary)) {
+                    insideSamples += 1
+
+                    if (projectedRevealCenters.any { center ->
+                            val dx = center.x - sample.x
+                            val dy = center.y - sample.y
+                            dx * dx + dy * dy <= revealRadiusSquared
+                        }
+                    ) {
+                        discoveredSamples += 1
+                    }
+                }
+                x += sampleSpacingMeters
+            }
+            y += sampleSpacingMeters
+        }
+
+        if (insideSamples == 0) return 0.0
+        return 100.0 * discoveredSamples / insideSamples
+    }
+
+    private fun determineSampleSpacingMeters(polygonAreaSquareMeters: Double): Double {
+        val targetSampleCount = 40_000.0
+        return (polygonAreaSquareMeters / targetSampleCount)
+            .pow(0.5)
+            .coerceIn(5.0, 40.0)
+    }
+
+    private fun projectToMeters(
+        point: GeoPoint,
+        referenceLatitude: Double,
+        referenceLongitude: Double
+    ): ProjectedPoint {
+        val latitudeRadians = Math.toRadians(referenceLatitude)
+        val x = (point.longitude - referenceLongitude) * 111_320.0 * cos(latitudeRadians)
+        val y = (point.latitude - referenceLatitude) * 110_540.0
+        return ProjectedPoint(x = x, y = y)
+    }
+
+    private fun computeBounds(points: List<ProjectedPoint>): Bounds? {
+        if (points.isEmpty()) return null
+
+        var minX = Double.POSITIVE_INFINITY
+        var maxX = Double.NEGATIVE_INFINITY
+        var minY = Double.POSITIVE_INFINITY
+        var maxY = Double.NEGATIVE_INFINITY
+
+        for (point in points) {
+            minX = minOf(minX, point.x)
+            maxX = maxOf(maxX, point.x)
+            minY = minOf(minY, point.y)
+            maxY = maxOf(maxY, point.y)
+        }
+
+        return Bounds(
+            minX = minX,
+            maxX = maxX,
+            minY = minY,
+            maxY = maxY
+        )
+    }
+
+    private fun polygonArea(points: List<ProjectedPoint>): Double {
+        if (points.size < 3) return 0.0
+
+        var twiceArea = 0.0
+        for (index in points.indices) {
+            val current = points[index]
+            val next = points[(index + 1) % points.size]
+            twiceArea += current.x * next.y - next.x * current.y
+        }
+
+        return kotlin.math.abs(twiceArea) / 2.0
+    }
+
+    private fun isInsideBoundary(
+        point: ProjectedPoint,
+        boundary: ProjectedBoundary
+    ): Boolean {
+        if (!isInsidePolygon(point, boundary.outerRing)) return false
+        return boundary.holes.none { hole -> isInsidePolygon(point, hole) }
+    }
+
+    private fun isInsidePolygon(
+        point: ProjectedPoint,
+        polygon: List<ProjectedPoint>
+    ): Boolean {
+        var inside = false
+        var previousIndex = polygon.lastIndex
+
+        for (currentIndex in polygon.indices) {
+            val current = polygon[currentIndex]
+            val previous = polygon[previousIndex]
+            val deltaY = previous.y - current.y
+            val safeDeltaY = if (deltaY == 0.0) 1e-9 else deltaY
+            val intersects =
+                ((current.y > point.y) != (previous.y > point.y)) &&
+                    (point.x < (previous.x - current.x) * (point.y - current.y) /
+                    safeDeltaY + current.x)
+
+            if (intersects) {
+                inside = !inside
+            }
+
+            previousIndex = currentIndex
+        }
+
+        return inside
+    }
+
     private data class CityBoundary(
         val outerRing: List<GeoPoint>,
         val holes: List<List<GeoPoint>>
+    )
+
+    private data class ProjectedPoint(
+        val x: Double,
+        val y: Double
+    )
+
+    private data class ProjectedBoundary(
+        val outerRing: List<ProjectedPoint>,
+        val holes: List<List<ProjectedPoint>>
+    )
+
+    private data class Bounds(
+        val minX: Double,
+        val maxX: Double,
+        val minY: Double,
+        val maxY: Double
     )
 
     private fun syncTrackingUi() {
