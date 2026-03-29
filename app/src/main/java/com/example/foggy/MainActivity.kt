@@ -75,6 +75,7 @@ class MainActivity : AppCompatActivity() {
     private var hasCenteredOnGps = false
     private var lastResolvedCityName: String? = null
     private var lastLoadedCityBoundaryKey: String? = null
+    @Volatile private var cityLookupInFlight = false
     private var currentCityBoundary: CityBoundary? = null
     private var currentProjectedCityBoundary: ProjectedBoundary? = null
     private var currentCityBoundaryCellCount: Int? = null
@@ -280,35 +281,42 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateCurrentCityFromLocation(location: GeoPoint?) {
         if (location == null || !Geocoder.isPresent()) return
+        if (cityLookupInFlight) return
 
+        cityLookupInFlight = true
         cityResolverExecutor.execute {
-            val cityName = reverseGeocodeCityName(location.latitude, location.longitude) ?: return@execute
-            val boundary = if (cityName != lastLoadedCityBoundaryKey) {
-                fetchCityBoundary(location.latitude, location.longitude)
-            } else {
-                null
-            }
-            val projectedBoundary = boundary?.let(::projectBoundaryToMercator)
-            val boundaryCellCount = projectedBoundary?.let(::countCellsInBoundary)
-
-            runOnUiThread {
-                if (cityName != lastResolvedCityName) {
-                    lastResolvedCityName = cityName
-                    currentCityText.text = cityName
+            try {
+                val cityName =
+                    reverseGeocodeCityName(location.latitude, location.longitude) ?: return@execute
+                val boundary = if (cityName != lastLoadedCityBoundaryKey) {
+                    fetchCityBoundary(location.latitude, location.longitude)
+                } else {
+                    null
                 }
+                val projectedBoundary = boundary?.let(::projectBoundaryToMercator)
+                val boundaryCellCount = projectedBoundary?.let(::countCellsInBoundary)
 
-                if (boundary != null) {
-                    lastLoadedCityBoundaryKey = cityName
-                    currentCityBoundary = boundary
-                    currentProjectedCityBoundary = projectedBoundary
-                    currentCityBoundaryCellCount = boundaryCellCount
-                    cityBoundaryOverlay.setPoints(boundary.outerRing)
-                    cityBoundaryOverlay.setHoles(boundary.holes)
-                    cityBoundaryOverlay.isVisible = true
-                    updateDiscoveredPercentage()
-                    keepOverlayOrder()
-                    map.invalidate()
+                runOnUiThread {
+                    if (cityName != lastResolvedCityName) {
+                        lastResolvedCityName = cityName
+                        currentCityText.text = cityName
+                    }
+
+                    if (boundary != null) {
+                        lastLoadedCityBoundaryKey = cityName
+                        currentCityBoundary = boundary
+                        currentProjectedCityBoundary = projectedBoundary
+                        currentCityBoundaryCellCount = boundaryCellCount
+                        cityBoundaryOverlay.setPoints(boundary.outerRing)
+                        cityBoundaryOverlay.setHoles(boundary.holes)
+                        cityBoundaryOverlay.isVisible = true
+                        updateDiscoveredPercentage()
+                        keepOverlayOrder()
+                        map.invalidate()
+                    }
                 }
+            } finally {
+                cityLookupInFlight = false
             }
         }
     }
