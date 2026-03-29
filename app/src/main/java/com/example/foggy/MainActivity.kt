@@ -452,7 +452,12 @@ class MainActivity : AppCompatActivity() {
                 )
             }
 
+            val boundingBox = mapView.boundingBox
             for (point in savedPointsOverlay.getPoints()) {
+                if (!boundingBox.contains(point.latitude, point.longitude)) {
+                    continue
+                }
+
                 drawRevealCircle(
                     canvas = canvas,
                     mapView = mapView,
