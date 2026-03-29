@@ -15,9 +15,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.widget.Button
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.io.IOException
+import java.util.Locale
+import android.location.Geocoder
 import org.osmdroid.config.Configuration
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
@@ -45,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var map: MapView
     private lateinit var fogModeButton: Button
     private lateinit var trackingButton: Button
+    private lateinit var currentCityText: TextView
     private lateinit var locationHistoryDatabase: LocationHistoryDatabase
     private lateinit var savedPointsOverlay: SavedPointsOverlay
     private lateinit var fogOverlay: FogOverlay
@@ -52,6 +57,7 @@ class MainActivity : AppCompatActivity() {
     private var useBlackFog = true
     private var hasCenteredOnSavedPoint = false
     private var hasCenteredOnGps = false
+    private var lastResolvedCityName: String? = null
     private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val pointsRefreshHandler = Handler(Looper.getMainLooper())
     private val pointsRefresher = object : Runnable {
@@ -74,6 +80,7 @@ class MainActivity : AppCompatActivity() {
         map = findViewById(R.id.map)
         fogModeButton = findViewById(R.id.fogModeButton)
         trackingButton = findViewById(R.id.trackingButton)
+        currentCityText = findViewById(R.id.currentCityText)
         locationHistoryDatabase = LocationHistoryDatabase(applicationContext)
         savedPointsOverlay = SavedPointsOverlay()
         fogOverlay = FogOverlay()
@@ -181,6 +188,7 @@ class MainActivity : AppCompatActivity() {
 
         overlay.enableMyLocation()
         centerMapOnGpsWhenAvailable(overlay)
+        updateCurrentCityFromLocation(overlay.myLocation)
         keepFogOverlayOnTop()
         map.invalidate()
     }
@@ -200,6 +208,7 @@ class MainActivity : AppCompatActivity() {
             val points = locationHistoryDatabase.getAllPoints()
             runOnUiThread {
                 savedPointsOverlay.setPoints(points)
+                updateCurrentCityFromLocation(locationOverlay?.myLocation)
                 map.invalidate()
             }
         }
@@ -229,6 +238,7 @@ class MainActivity : AppCompatActivity() {
             val myLocation = overlay.myLocation ?: return@runOnFirstFix
             runOnUiThread {
                 centerMapOnGps(myLocation)
+                updateCurrentCityFromLocation(myLocation)
             }
         }
     }
@@ -238,6 +248,35 @@ class MainActivity : AppCompatActivity() {
 
         map.controller.animateTo(myLocation)
         hasCenteredOnGps = true
+    }
+
+    private fun updateCurrentCityFromLocation(location: GeoPoint?) {
+        if (location == null || !Geocoder.isPresent()) return
+
+        databaseExecutor.execute {
+            val cityName = reverseGeocodeCityName(location.latitude, location.longitude) ?: return@execute
+            if (cityName == lastResolvedCityName) return@execute
+
+            runOnUiThread {
+                lastResolvedCityName = cityName
+                currentCityText.text = cityName
+            }
+        }
+    }
+
+    private fun reverseGeocodeCityName(latitude: Double, longitude: Double): String? {
+        return try {
+            val geocoder = Geocoder(this, Locale.getDefault())
+            val address = geocoder.getFromLocation(latitude, longitude, 1)?.firstOrNull() ?: return null
+
+            address.locality
+                ?: address.subAdminArea
+                ?: address.adminArea
+        } catch (_: IOException) {
+            null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
     }
 
     private fun syncTrackingUi() {
