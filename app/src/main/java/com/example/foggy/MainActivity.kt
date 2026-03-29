@@ -426,18 +426,12 @@ class MainActivity : AppCompatActivity() {
             discoveredPercentText.text = getString(R.string.discovered_percent_default)
             return
         }
-        val savedPoints = savedPointsOverlay.getPoints()
-        val currentLocation = locationOverlay?.myLocation
 
         databaseExecutor.execute {
-            val revealCenters = buildList {
-                addAll(savedPoints.map { GeoPoint(it.latitude, it.longitude) })
-                if (currentLocation != null) {
-                    add(GeoPoint(currentLocation.latitude, currentLocation.longitude))
-                }
-            }
-
-            val percentage = computeDiscoveredPercentage(boundary, revealCenters)
+            val percentage = computeDiscoveredPercentage(
+                boundary,
+                locationHistoryDatabase.getAllCells()
+            )
             val formattedPercentage = String.format(Locale.US, "%.3f%%", percentage)
 
             runOnUiThread {
@@ -448,80 +442,53 @@ class MainActivity : AppCompatActivity() {
 
     private fun computeDiscoveredPercentage(
         boundary: CityBoundary,
-        revealCenters: List<GeoPoint>
+        discoveredCells: List<LocationHistoryDatabase.StoredGridCell>
     ): Double {
-        if (revealCenters.isEmpty()) return 0.0
+        if (discoveredCells.isEmpty()) return 0.0
 
-        val referencePoint = boundary.outerRing.firstOrNull() ?: return 0.0
         val projectedBoundary = ProjectedBoundary(
             outerRing = boundary.outerRing.map {
-                projectToMeters(it, referencePoint.latitude, referencePoint.longitude)
+                ProjectedPoint(
+                    x = longitudeToWebMercatorX(it.longitude),
+                    y = latitudeToWebMercatorY(it.latitude)
+                )
             },
             holes = boundary.holes.map { hole ->
-                hole.map { projectToMeters(it, referencePoint.latitude, referencePoint.longitude) }
+                hole.map {
+                    ProjectedPoint(
+                        x = longitudeToWebMercatorX(it.longitude),
+                        y = latitudeToWebMercatorY(it.latitude)
+                    )
+                }
             }
         )
-        val projectedRevealCenters = revealCenters.map {
-            projectToMeters(it, referencePoint.latitude, referencePoint.longitude)
-        }
-
         val bounds = computeBounds(projectedBoundary.outerRing) ?: return 0.0
-        val polygonArea =
-            polygonArea(projectedBoundary.outerRing) -
-                projectedBoundary.holes.sumOf(::polygonArea)
-        if (polygonArea <= 0.0) return 0.0
+        val discoveredCellSet = discoveredCells.map { it.column to it.row }.toHashSet()
+        val minColumn = kotlin.math.floor(bounds.minX / GRID_CELL_SIZE_METERS).toLong()
+        val maxColumn = kotlin.math.ceil(bounds.maxX / GRID_CELL_SIZE_METERS).toLong()
+        val minRow = kotlin.math.floor(bounds.minY / GRID_CELL_SIZE_METERS).toLong()
+        val maxRow = kotlin.math.ceil(bounds.maxY / GRID_CELL_SIZE_METERS).toLong()
+        var totalCellsInBoundary = 0
+        var discoveredCellsInBoundary = 0
 
-        val sampleSpacingMeters = determineSampleSpacingMeters(polygonArea)
-        val sampleOffset = sampleSpacingMeters / 2.0
-        val revealRadiusSquared = CLEAR_RADIUS_METERS * CLEAR_RADIUS_METERS
-        var insideSamples = 0
-        var discoveredSamples = 0
-        var y = bounds.minY
-
-        while (y <= bounds.maxY) {
-            var x = bounds.minX
-            while (x <= bounds.maxX) {
-                val sample = ProjectedPoint(
-                    x = x + sampleOffset,
-                    y = y + sampleOffset
-                )
-                if (isInsideBoundary(sample, projectedBoundary)) {
-                    insideSamples += 1
-
-                    if (projectedRevealCenters.any { center ->
-                            val dx = center.x - sample.x
-                            val dy = center.y - sample.y
-                            dx * dx + dy * dy <= revealRadiusSquared
-                        }
-                    ) {
-                        discoveredSamples += 1
-                    }
+        for (column in minColumn..maxColumn) {
+            val centerX = (column + 0.5) * GRID_CELL_SIZE_METERS
+            for (row in minRow..maxRow) {
+                val centerY = (row + 0.5) * GRID_CELL_SIZE_METERS
+                val cellCenter = ProjectedPoint(centerX, centerY)
+                if (!isInsideBoundary(cellCenter, projectedBoundary)) {
+                    continue
                 }
-                x += sampleSpacingMeters
+
+                totalCellsInBoundary += 1
+                if ((column to row) in discoveredCellSet) {
+                    discoveredCellsInBoundary += 1
+                }
             }
-            y += sampleSpacingMeters
         }
 
-        if (insideSamples == 0) return 0.0
-        return 100.0 * discoveredSamples / insideSamples
-    }
-
-    private fun determineSampleSpacingMeters(polygonAreaSquareMeters: Double): Double {
-        val targetSampleCount = 40_000.0
-        return (polygonAreaSquareMeters / targetSampleCount)
-            .pow(0.5)
-            .coerceIn(5.0, 40.0)
-    }
-
-    private fun projectToMeters(
-        point: GeoPoint,
-        referenceLatitude: Double,
-        referenceLongitude: Double
-    ): ProjectedPoint {
-        val latitudeRadians = Math.toRadians(referenceLatitude)
-        val x = (point.longitude - referenceLongitude) * 111_320.0 * cos(latitudeRadians)
-        val y = (point.latitude - referenceLatitude) * 110_540.0
-        return ProjectedPoint(x = x, y = y)
+        if (totalCellsInBoundary == 0) return 0.0
+        return 100.0 * discoveredCellsInBoundary / totalCellsInBoundary
     }
 
     private fun computeBounds(points: List<ProjectedPoint>): Bounds? {
@@ -593,6 +560,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         return inside
+    }
+
+    private fun longitudeToWebMercatorX(longitude: Double): Double {
+        return WEB_MERCATOR_HALF_WORLD_METERS * longitude / 180.0
+    }
+
+    private fun latitudeToWebMercatorY(latitude: Double): Double {
+        val radians = Math.toRadians(latitude.coerceIn(-85.05112878, 85.05112878))
+        return 6_378_137.0 * kotlin.math.ln(kotlin.math.tan(Math.PI / 4.0 + radians / 2.0))
     }
 
     private data class CityBoundary(
@@ -791,8 +767,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         private fun drawRevealedGridCells(canvas: Canvas, mapView: MapView) {
-            val revealedCells = mutableSetOf<Pair<Long, Long>>()
-            val visibleBounds = expandedVisibleBounds(mapView)
+            clearPaint.shader = null
+            val screenWidth = mapView.width.toFloat()
+            val screenHeight = mapView.height.toFloat()
+            val visibleBounds = visibleBounds(mapView)
 
             for (point in savedPointsOverlay.getPoints()) {
                 if (!visibleBounds.contains(point.latitude, point.longitude)) {
@@ -801,42 +779,8 @@ class MainActivity : AppCompatActivity() {
 
                 val pointX = longitudeToWebMercatorX(point.longitude)
                 val pointY = latitudeToWebMercatorY(point.latitude)
-                val minColumn = kotlin.math.floor((pointX - CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
-                val maxColumn = kotlin.math.ceil((pointX + CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
-                val minRow = kotlin.math.floor((pointY - CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
-                val maxRow = kotlin.math.ceil((pointY + CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
-
-                for (column in minColumn..maxColumn) {
-                    val cellLeft = column * GRID_CELL_SIZE_METERS
-                    val cellRight = cellLeft + GRID_CELL_SIZE_METERS
-
-                    for (row in minRow..maxRow) {
-                        val cellTop = row * GRID_CELL_SIZE_METERS
-                        val cellBottom = cellTop + GRID_CELL_SIZE_METERS
-
-                        val dx = when {
-                            pointX < cellLeft -> cellLeft - pointX
-                            pointX > cellRight -> pointX - cellRight
-                            else -> 0.0
-                        }
-                        val dy = when {
-                            pointY < cellTop -> cellTop - pointY
-                            pointY > cellBottom -> pointY - cellBottom
-                            else -> 0.0
-                        }
-
-                        if (dx * dx + dy * dy <= CLEAR_RADIUS_METERS * CLEAR_RADIUS_METERS) {
-                            revealedCells.add(column to row)
-                        }
-                    }
-                }
-            }
-
-            clearPaint.shader = null
-            val screenWidth = mapView.width.toFloat()
-            val screenHeight = mapView.height.toFloat()
-
-            for ((column, row) in revealedCells) {
+                val column = kotlin.math.floor(pointX / GRID_CELL_SIZE_METERS).toLong()
+                val row = kotlin.math.floor(pointY / GRID_CELL_SIZE_METERS).toLong()
                 val left = column * GRID_CELL_SIZE_METERS
                 val right = left + GRID_CELL_SIZE_METERS
                 val top = row * GRID_CELL_SIZE_METERS
@@ -864,12 +808,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        private fun expandedVisibleBounds(mapView: MapView): VisibleBounds {
+        private fun visibleBounds(mapView: MapView): VisibleBounds {
             val boundingBox = mapView.boundingBox
             val centerLatitude = (boundingBox.latNorth + boundingBox.latSouth) / 2.0
-            val latitudeMargin = CLEAR_RADIUS_METERS / 110_540.0
+            val latitudeMargin = GRID_CELL_SIZE_METERS / 110_540.0
             val longitudeMargin =
-                CLEAR_RADIUS_METERS /
+                GRID_CELL_SIZE_METERS /
                     (111_320.0 * cos(Math.toRadians(centerLatitude)).coerceAtLeast(0.01))
 
             return VisibleBounds(

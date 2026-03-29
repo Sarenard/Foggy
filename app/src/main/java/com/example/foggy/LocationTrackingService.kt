@@ -146,7 +146,7 @@ class LocationTrackingService : Service() {
         private const val CHANNEL_ID = "tracking_channel"
         private const val CHANNEL_NAME = "Tracking"
         private const val NOTIFICATION_ID = 1001
-        private const val LOCATION_SAVE_INTERVAL_MS = 10_000L
+        private const val LOCATION_SAVE_INTERVAL_MS = 1_000L
         private const val PREFS_NAME = "tracking_prefs"
         private const val KEY_TRACKING_ACTIVE = "tracking_active"
 
