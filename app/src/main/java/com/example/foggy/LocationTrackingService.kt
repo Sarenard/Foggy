@@ -115,9 +115,10 @@ class LocationTrackingService : Service() {
     }
 
     private fun buildNotification(): Notification {
+        val intervalSeconds = (LOCATION_SAVE_INTERVAL_MS / 1_000L).toInt()
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.tracking_notification_title))
-            .setContentText(getString(R.string.tracking_notification_text))
+            .setContentText(getString(R.string.tracking_notification_text, intervalSeconds))
             .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
             .build()
