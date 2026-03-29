@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
@@ -46,13 +47,16 @@ class MainActivity : AppCompatActivity() {
         private const val LOCATION_PERMISSION_REQUEST_CODE = 1
         private const val BACKGROUND_LOCATION_PERMISSION_REQUEST_CODE = 2
         private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 3
-        private const val POINTS_REFRESH_INTERVAL_MS = 10_000L
+        private const val POINTS_REFRESH_INTERVAL_MS = 1_000L
         private const val POINT_DIAMETER_METERS = 3.0
-        private const val CLEAR_RADIUS_METERS = 10.0
+        private const val CLEAR_RADIUS_METERS = 15.0
         private const val CLEAR_EDGE_FEATHER_METERS = 6.0
+        private const val GRID_CELL_SIZE_METERS = 15.0
+        private const val MIN_GRID_CELL_SIZE_PIXELS = 12.0
         private const val SHOW_SAVED_POINTS = false
         private const val NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org/reverse"
         private const val NOMINATIM_USER_AGENT = "Foggy/1.0 (city-boundary feature)"
+        private const val WEB_MERCATOR_HALF_WORLD_METERS = 20_037_508.342789244
     }
 
     private lateinit var map: MapView
@@ -62,6 +66,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var currentCityText: TextView
     private lateinit var locationHistoryDatabase: LocationHistoryDatabase
     private lateinit var savedPointsOverlay: SavedPointsOverlay
+    private lateinit var gridOverlay: GridOverlay
     private lateinit var cityBoundaryOverlay: Polygon
     private lateinit var fogOverlay: FogOverlay
     private var locationOverlay: MyLocationNewOverlay? = null
@@ -97,6 +102,7 @@ class MainActivity : AppCompatActivity() {
         currentCityText = findViewById(R.id.currentCityText)
         locationHistoryDatabase = LocationHistoryDatabase(applicationContext)
         savedPointsOverlay = SavedPointsOverlay()
+        gridOverlay = GridOverlay()
         cityBoundaryOverlay = createCityBoundaryOverlay()
         fogOverlay = FogOverlay()
 
@@ -104,6 +110,7 @@ class MainActivity : AppCompatActivity() {
         map.controller.setZoom(16.0)
         map.controller.setCenter(GeoPoint(45.75, 4.85))
         map.overlays.add(savedPointsOverlay)
+        map.overlays.add(gridOverlay)
         map.overlays.add(fogOverlay)
         map.overlays.add(cityBoundaryOverlay)
         centerMapOnSavedPointAtStartup()
@@ -321,6 +328,7 @@ class MainActivity : AppCompatActivity() {
             outlinePaint.style = Paint.Style.STROKE
             fillPaint.color = Color.TRANSPARENT
             isVisible = false
+            setOnClickListener { _, _, _ -> true }
         }
     }
 
@@ -621,8 +629,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun keepOverlayOrder() {
+        map.overlays.remove(gridOverlay)
         map.overlays.remove(fogOverlay)
         map.overlays.remove(cityBoundaryOverlay)
+        map.overlays.add(gridOverlay)
         map.overlays.add(fogOverlay)
         map.overlays.add(cityBoundaryOverlay)
     }
@@ -775,87 +785,224 @@ class MainActivity : AppCompatActivity() {
                 fogPaint
             )
 
-            locationOverlay?.myLocation?.let { myLocation ->
-                drawRevealCircle(
-                    canvas = canvas,
-                    mapView = mapView,
-                    latitude = myLocation.latitude,
-                    longitude = myLocation.longitude
-                )
-            }
-
-            val boundingBox = mapView.boundingBox
-            for (point in savedPointsOverlay.getPoints()) {
-                if (!boundingBox.contains(point.latitude, point.longitude)) {
-                    continue
-                }
-
-                drawRevealCircle(
-                    canvas = canvas,
-                    mapView = mapView,
-                    latitude = point.latitude,
-                    longitude = point.longitude
-                )
-            }
+            drawRevealedGridCells(canvas, mapView)
 
             canvas.restoreToCount(layerId)
         }
 
-        private fun drawRevealCircle(
-            canvas: Canvas,
-            mapView: MapView,
-            latitude: Double,
-            longitude: Double
-        ) {
-            val geoPoint = GeoPoint(latitude, longitude)
-            val screenPoint = mapView.projection.toPixels(geoPoint, null)
-            val clearRadiusPixels = metersToPixels(
-                meters = CLEAR_RADIUS_METERS,
-                latitude = latitude,
-                zoomLevel = mapView.zoomLevelDouble
-            )
-            val featherRadiusPixels = metersToPixels(
-                meters = CLEAR_EDGE_FEATHER_METERS,
-                latitude = latitude,
-                zoomLevel = mapView.zoomLevelDouble
-            )
-            val outerRadiusPixels =
-                (clearRadiusPixels + featherRadiusPixels).toFloat().coerceAtLeast(1f)
+        private fun drawRevealedGridCells(canvas: Canvas, mapView: MapView) {
+            val revealedCells = mutableSetOf<Pair<Long, Long>>()
+            val visibleBounds = expandedVisibleBounds(mapView)
 
-            if (screenPoint.x + outerRadiusPixels < 0f ||
-                screenPoint.x - outerRadiusPixels > mapView.width.toFloat() ||
-                screenPoint.y + outerRadiusPixels < 0f ||
-                screenPoint.y - outerRadiusPixels > mapView.height.toFloat()
-            ) {
-                return
+            for (point in savedPointsOverlay.getPoints()) {
+                if (!visibleBounds.contains(point.latitude, point.longitude)) {
+                    continue
+                }
+
+                val pointX = longitudeToWebMercatorX(point.longitude)
+                val pointY = latitudeToWebMercatorY(point.latitude)
+                val minColumn = kotlin.math.floor((pointX - CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
+                val maxColumn = kotlin.math.ceil((pointX + CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
+                val minRow = kotlin.math.floor((pointY - CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
+                val maxRow = kotlin.math.ceil((pointY + CLEAR_RADIUS_METERS) / GRID_CELL_SIZE_METERS).toLong()
+
+                for (column in minColumn..maxColumn) {
+                    val cellLeft = column * GRID_CELL_SIZE_METERS
+                    val cellRight = cellLeft + GRID_CELL_SIZE_METERS
+
+                    for (row in minRow..maxRow) {
+                        val cellTop = row * GRID_CELL_SIZE_METERS
+                        val cellBottom = cellTop + GRID_CELL_SIZE_METERS
+
+                        val dx = when {
+                            pointX < cellLeft -> cellLeft - pointX
+                            pointX > cellRight -> pointX - cellRight
+                            else -> 0.0
+                        }
+                        val dy = when {
+                            pointY < cellTop -> cellTop - pointY
+                            pointY > cellBottom -> pointY - cellBottom
+                            else -> 0.0
+                        }
+
+                        if (dx * dx + dy * dy <= CLEAR_RADIUS_METERS * CLEAR_RADIUS_METERS) {
+                            revealedCells.add(column to row)
+                        }
+                    }
+                }
             }
 
-            val innerStop =
-                (clearRadiusPixels / (clearRadiusPixels + featherRadiusPixels))
-                    .toFloat()
-                    .coerceIn(0f, 1f)
-
-            clearPaint.shader = RadialGradient(
-                screenPoint.x.toFloat(),
-                screenPoint.y.toFloat(),
-                outerRadiusPixels,
-                intArrayOf(
-                    Color.argb(255, 0, 0, 0),
-                    Color.argb(255, 0, 0, 0),
-                    Color.argb(0, 0, 0, 0)
-                ),
-                floatArrayOf(0f, innerStop, 1f),
-                Shader.TileMode.CLAMP
-            )
-
-            canvas.drawCircle(screenPoint.x.toFloat(), screenPoint.y.toFloat(), outerRadiusPixels, clearPaint)
             clearPaint.shader = null
+            val screenWidth = mapView.width.toFloat()
+            val screenHeight = mapView.height.toFloat()
+
+            for ((column, row) in revealedCells) {
+                val left = column * GRID_CELL_SIZE_METERS
+                val right = left + GRID_CELL_SIZE_METERS
+                val top = row * GRID_CELL_SIZE_METERS
+                val bottom = top + GRID_CELL_SIZE_METERS
+
+                val topLeft = mapView.projection.toPixels(
+                    GeoPoint(webMercatorYToLatitude(top), webMercatorXToLongitude(left)),
+                    null
+                )
+                val bottomRight = mapView.projection.toPixels(
+                    GeoPoint(webMercatorYToLatitude(bottom), webMercatorXToLongitude(right)),
+                    null
+                )
+
+                val rectLeft = minOf(topLeft.x, bottomRight.x).toFloat()
+                val rectRight = maxOf(topLeft.x, bottomRight.x).toFloat()
+                val rectTop = minOf(topLeft.y, bottomRight.y).toFloat()
+                val rectBottom = maxOf(topLeft.y, bottomRight.y).toFloat()
+
+                if (rectRight < 0f || rectLeft > screenWidth || rectBottom < 0f || rectTop > screenHeight) {
+                    continue
+                }
+
+                canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
+            }
+        }
+
+        private fun expandedVisibleBounds(mapView: MapView): VisibleBounds {
+            val boundingBox = mapView.boundingBox
+            val centerLatitude = (boundingBox.latNorth + boundingBox.latSouth) / 2.0
+            val latitudeMargin = CLEAR_RADIUS_METERS / 110_540.0
+            val longitudeMargin =
+                CLEAR_RADIUS_METERS /
+                    (111_320.0 * cos(Math.toRadians(centerLatitude)).coerceAtLeast(0.01))
+
+            return VisibleBounds(
+                north = (boundingBox.latNorth + latitudeMargin).coerceAtMost(85.05112878),
+                south = (boundingBox.latSouth - latitudeMargin).coerceAtLeast(-85.05112878),
+                west = boundingBox.lonWest - longitudeMargin,
+                east = boundingBox.lonEast + longitudeMargin
+            )
+        }
+
+        private fun longitudeToWebMercatorX(longitude: Double): Double {
+            return WEB_MERCATOR_HALF_WORLD_METERS * longitude / 180.0
+        }
+
+        private fun latitudeToWebMercatorY(latitude: Double): Double {
+            val radians = Math.toRadians(latitude.coerceIn(-85.05112878, 85.05112878))
+            return 6_378_137.0 * kotlin.math.ln(kotlin.math.tan(Math.PI / 4.0 + radians / 2.0))
+        }
+
+        private fun webMercatorXToLongitude(x: Double): Double {
+            return (x / WEB_MERCATOR_HALF_WORLD_METERS) * 180.0
+        }
+
+        private fun webMercatorYToLatitude(y: Double): Double {
+            val radians = 2.0 * kotlin.math.atan(kotlin.math.exp(y / 6_378_137.0)) - Math.PI / 2.0
+            return Math.toDegrees(radians)
+        }
+    }
+
+    private inner class GridOverlay : Overlay() {
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(160, 255, 214, 10)
+            style = Paint.Style.STROKE
+            strokeWidth = 1f
+        }
+
+        override fun draw(canvas: Canvas, mapView: MapView, shadow: Boolean) {
+            if (shadow) return
+
+            val center = mapView.mapCenter as? GeoPoint ?: return
+            val cellSizePixels = metersToPixels(
+                meters = GRID_CELL_SIZE_METERS,
+                latitude = center.latitude,
+                zoomLevel = mapView.zoomLevelDouble
+            )
+            if (cellSizePixels < MIN_GRID_CELL_SIZE_PIXELS) return
+
+            val boundingBox = mapView.boundingBox
+            val north = boundingBox.latNorth.coerceIn(-85.05112878, 85.05112878)
+            val south = boundingBox.latSouth.coerceIn(-85.05112878, 85.05112878)
+            val west = boundingBox.lonWest
+            val east = boundingBox.lonEast
+
+            val minX = longitudeToWebMercatorX(west)
+            val maxX = longitudeToWebMercatorX(east)
+            val minY = latitudeToWebMercatorY(south)
+            val maxY = latitudeToWebMercatorY(north)
+
+            val startColumn = kotlin.math.floor(minX / GRID_CELL_SIZE_METERS).toLong()
+            val endColumn = kotlin.math.ceil(maxX / GRID_CELL_SIZE_METERS).toLong()
+            val startRow = kotlin.math.floor(minY / GRID_CELL_SIZE_METERS).toLong()
+            val endRow = kotlin.math.ceil(maxY / GRID_CELL_SIZE_METERS).toLong()
+
+            val path = Path()
+
+            for (column in startColumn..endColumn) {
+                val x = column * GRID_CELL_SIZE_METERS
+                val startPoint = GeoPoint(
+                    webMercatorYToLatitude(minY),
+                    webMercatorXToLongitude(x)
+                )
+                val endPoint = GeoPoint(
+                    webMercatorYToLatitude(maxY),
+                    webMercatorXToLongitude(x)
+                )
+                val startPixels = mapView.projection.toPixels(startPoint, null)
+                val endPixels = mapView.projection.toPixels(endPoint, null)
+                path.moveTo(startPixels.x.toFloat(), startPixels.y.toFloat())
+                path.lineTo(endPixels.x.toFloat(), endPixels.y.toFloat())
+            }
+
+            for (row in startRow..endRow) {
+                val y = row * GRID_CELL_SIZE_METERS
+                val startPoint = GeoPoint(
+                    webMercatorYToLatitude(y),
+                    webMercatorXToLongitude(minX)
+                )
+                val endPoint = GeoPoint(
+                    webMercatorYToLatitude(y),
+                    webMercatorXToLongitude(maxX)
+                )
+                val startPixels = mapView.projection.toPixels(startPoint, null)
+                val endPixels = mapView.projection.toPixels(endPoint, null)
+                path.moveTo(startPixels.x.toFloat(), startPixels.y.toFloat())
+                path.lineTo(endPixels.x.toFloat(), endPixels.y.toFloat())
+            }
+
+            canvas.drawPath(path, linePaint)
+        }
+
+        private fun longitudeToWebMercatorX(longitude: Double): Double {
+            return WEB_MERCATOR_HALF_WORLD_METERS * longitude / 180.0
+        }
+
+        private fun latitudeToWebMercatorY(latitude: Double): Double {
+            val radians = Math.toRadians(latitude.coerceIn(-85.05112878, 85.05112878))
+            return 6_378_137.0 * kotlin.math.ln(kotlin.math.tan(Math.PI / 4.0 + radians / 2.0))
+        }
+
+        private fun webMercatorXToLongitude(x: Double): Double {
+            return (x / WEB_MERCATOR_HALF_WORLD_METERS) * 180.0
+        }
+
+        private fun webMercatorYToLatitude(y: Double): Double {
+            val radians = 2.0 * kotlin.math.atan(kotlin.math.exp(y / 6_378_137.0)) - Math.PI / 2.0
+            return Math.toDegrees(radians)
         }
 
         private fun metersToPixels(meters: Double, latitude: Double, zoomLevel: Double): Double {
             val metersPerPixel =
                 156543.03392 * cos(Math.toRadians(latitude)) / 2.0.pow(zoomLevel)
             return if (metersPerPixel > 0.0) meters / metersPerPixel else meters
+        }
+    }
+
+    private data class VisibleBounds(
+        val north: Double,
+        val south: Double,
+        val west: Double,
+        val east: Double
+    ) {
+        fun contains(latitude: Double, longitude: Double): Boolean {
+            return latitude in south..north && longitude in west..east
         }
     }
 }
