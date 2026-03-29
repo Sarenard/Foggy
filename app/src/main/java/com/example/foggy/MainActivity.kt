@@ -77,6 +77,7 @@ class MainActivity : AppCompatActivity() {
     private var lastLoadedCityBoundaryKey: String? = null
     private var currentCityBoundary: CityBoundary? = null
     private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val cityResolverExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val pointsRefreshHandler = Handler(Looper.getMainLooper())
     private val pointsRefresher = object : Runnable {
         override fun run() {
@@ -278,7 +279,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateCurrentCityFromLocation(location: GeoPoint?) {
         if (location == null || !Geocoder.isPresent()) return
 
-        databaseExecutor.execute {
+        cityResolverExecutor.execute {
             val cityName = reverseGeocodeCityName(location.latitude, location.longitude) ?: return@execute
             val boundary = if (cityName != lastLoadedCityBoundaryKey) {
                 fetchCityBoundary(location.latitude, location.longitude)
@@ -671,6 +672,7 @@ class MainActivity : AppCompatActivity() {
         disableLocationOverlay()
         locationHistoryDatabase.close()
         databaseExecutor.shutdown()
+        cityResolverExecutor.shutdown()
         super.onDestroy()
     }
 
