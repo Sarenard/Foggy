@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Foggy</string>
+    <string name="start_tracking">Start tracking</string>
+    <string name="stop_tracking">Stop tracking</string>
+    <string name="show_black_fog">Show black</string>
+    <string name="show_default_fog">Show normal</string>
+    <string name="tracking_notification_title">Foggy tracking active</string>
+    <string name="tracking_notification_text">Saving GPS points every 10 seconds.</string>
+</resources>
