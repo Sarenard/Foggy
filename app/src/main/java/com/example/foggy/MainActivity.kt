@@ -19,13 +19,20 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.io.BufferedReader
 import java.io.IOException
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
 import android.location.Geocoder
+import org.json.JSONArray
+import org.json.JSONObject
 import org.osmdroid.config.Configuration
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Overlay
+import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import java.util.concurrent.ExecutorService
@@ -44,6 +51,8 @@ class MainActivity : AppCompatActivity() {
         private const val CLEAR_RADIUS_METERS = 10.0
         private const val CLEAR_EDGE_FEATHER_METERS = 6.0
         private const val SHOW_SAVED_POINTS = false
+        private const val NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org/reverse"
+        private const val NOMINATIM_USER_AGENT = "Foggy/1.0 (city-boundary feature)"
     }
 
     private lateinit var map: MapView
@@ -52,12 +61,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var currentCityText: TextView
     private lateinit var locationHistoryDatabase: LocationHistoryDatabase
     private lateinit var savedPointsOverlay: SavedPointsOverlay
+    private lateinit var cityBoundaryOverlay: Polygon
     private lateinit var fogOverlay: FogOverlay
     private var locationOverlay: MyLocationNewOverlay? = null
     private var useBlackFog = true
     private var hasCenteredOnSavedPoint = false
     private var hasCenteredOnGps = false
     private var lastResolvedCityName: String? = null
+    private var lastLoadedCityBoundaryKey: String? = null
     private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val pointsRefreshHandler = Handler(Looper.getMainLooper())
     private val pointsRefresher = object : Runnable {
@@ -83,6 +94,7 @@ class MainActivity : AppCompatActivity() {
         currentCityText = findViewById(R.id.currentCityText)
         locationHistoryDatabase = LocationHistoryDatabase(applicationContext)
         savedPointsOverlay = SavedPointsOverlay()
+        cityBoundaryOverlay = createCityBoundaryOverlay()
         fogOverlay = FogOverlay()
 
         map.setMultiTouchControls(true)
@@ -90,6 +102,7 @@ class MainActivity : AppCompatActivity() {
         map.controller.setCenter(GeoPoint(45.75, 4.85))
         map.overlays.add(savedPointsOverlay)
         map.overlays.add(fogOverlay)
+        map.overlays.add(cityBoundaryOverlay)
         centerMapOnSavedPointAtStartup()
 
         trackingButton.setOnClickListener {
@@ -189,7 +202,7 @@ class MainActivity : AppCompatActivity() {
         overlay.enableMyLocation()
         centerMapOnGpsWhenAvailable(overlay)
         updateCurrentCityFromLocation(overlay.myLocation)
-        keepFogOverlayOnTop()
+        keepOverlayOrder()
         map.invalidate()
     }
 
@@ -199,7 +212,7 @@ class MainActivity : AppCompatActivity() {
             map.overlays.remove(overlay)
         }
         locationOverlay = null
-        keepFogOverlayOnTop()
+        keepOverlayOrder()
         map.invalidate()
     }
 
@@ -255,11 +268,26 @@ class MainActivity : AppCompatActivity() {
 
         databaseExecutor.execute {
             val cityName = reverseGeocodeCityName(location.latitude, location.longitude) ?: return@execute
-            if (cityName == lastResolvedCityName) return@execute
+            val boundary = if (cityName != lastLoadedCityBoundaryKey) {
+                fetchCityBoundary(location.latitude, location.longitude)
+            } else {
+                null
+            }
 
             runOnUiThread {
-                lastResolvedCityName = cityName
-                currentCityText.text = cityName
+                if (cityName != lastResolvedCityName) {
+                    lastResolvedCityName = cityName
+                    currentCityText.text = cityName
+                }
+
+                if (boundary != null) {
+                    lastLoadedCityBoundaryKey = cityName
+                    cityBoundaryOverlay.setPoints(boundary.outerRing)
+                    cityBoundaryOverlay.setHoles(boundary.holes)
+                    cityBoundaryOverlay.isVisible = true
+                    keepOverlayOrder()
+                    map.invalidate()
+                }
             }
         }
     }
@@ -279,6 +307,110 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun createCityBoundaryOverlay(): Polygon {
+        return Polygon(map).apply {
+            outlinePaint.color = Color.argb(255, 255, 214, 10)
+            outlinePaint.strokeWidth = 5f
+            outlinePaint.style = Paint.Style.STROKE
+            fillPaint.color = Color.TRANSPARENT
+            isVisible = false
+        }
+    }
+
+    private fun fetchCityBoundary(latitude: Double, longitude: Double): CityBoundary? {
+        val url = URL(
+            "$NOMINATIM_BASE_URL?format=jsonv2&lat=$latitude&lon=$longitude&zoom=10" +
+                "&polygon_geojson=1&polygon_threshold=0.0003"
+        )
+
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 10_000
+            setRequestProperty("User-Agent", NOMINATIM_USER_AGENT)
+            setRequestProperty("Accept", "application/json")
+        }
+
+        return try {
+            if (connection.responseCode !in 200..299) return null
+
+            val response = connection.inputStream.bufferedReader().use(BufferedReader::readText)
+            parseCityBoundary(JSONObject(response).optJSONObject("geojson") ?: return null)
+        } catch (_: IOException) {
+            null
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun parseCityBoundary(geoJson: JSONObject): CityBoundary? {
+        return when (geoJson.optString("type")) {
+            "Polygon" -> parsePolygonCoordinates(geoJson.optJSONArray("coordinates") ?: return null)
+            "MultiPolygon" -> parseMultiPolygonCoordinates(geoJson.optJSONArray("coordinates") ?: return null)
+            else -> null
+        }
+    }
+
+    private fun parseMultiPolygonCoordinates(coordinates: JSONArray): CityBoundary? {
+        var largestBoundary: CityBoundary? = null
+        var largestSize = -1
+
+        for (index in 0 until coordinates.length()) {
+            val polygonCoordinates = coordinates.optJSONArray(index) ?: continue
+            val boundary = parsePolygonCoordinates(polygonCoordinates) ?: continue
+            val candidateSize = boundary.outerRing.size
+
+            if (candidateSize > largestSize) {
+                largestSize = candidateSize
+                largestBoundary = boundary
+            }
+        }
+
+        return largestBoundary
+    }
+
+    private fun parsePolygonCoordinates(coordinates: JSONArray): CityBoundary? {
+        if (coordinates.length() == 0) return null
+
+        val outerRing = parseRing(coordinates.optJSONArray(0) ?: return null)
+        if (outerRing.isEmpty()) return null
+
+        val holes = mutableListOf<List<GeoPoint>>()
+        for (index in 1 until coordinates.length()) {
+            val hole = parseRing(coordinates.optJSONArray(index) ?: continue)
+            if (hole.isNotEmpty()) {
+                holes.add(hole)
+            }
+        }
+
+        return CityBoundary(
+            outerRing = outerRing,
+            holes = holes
+        )
+    }
+
+    private fun parseRing(ringCoordinates: JSONArray): List<GeoPoint> {
+        val points = mutableListOf<GeoPoint>()
+
+        for (index in 0 until ringCoordinates.length()) {
+            val coordinate = ringCoordinates.optJSONArray(index) ?: continue
+            if (coordinate.length() < 2) continue
+
+            val longitude = coordinate.optDouble(0, Double.NaN)
+            val latitude = coordinate.optDouble(1, Double.NaN)
+            if (latitude.isNaN() || longitude.isNaN()) continue
+
+            points.add(GeoPoint(latitude, longitude))
+        }
+
+        return points
+    }
+
+    private data class CityBoundary(
+        val outerRing: List<GeoPoint>,
+        val holes: List<List<GeoPoint>>
+    )
+
     private fun syncTrackingUi() {
         val trackingActive = LocationTrackingService.isTrackingActive(this)
         if (trackingActive && hasFineLocationPermission()) {
@@ -286,13 +418,15 @@ class MainActivity : AppCompatActivity() {
         } else {
             disableLocationOverlay()
         }
-        keepFogOverlayOnTop()
+        keepOverlayOrder()
         updateTrackingButton()
     }
 
-    private fun keepFogOverlayOnTop() {
+    private fun keepOverlayOrder() {
         map.overlays.remove(fogOverlay)
+        map.overlays.remove(cityBoundaryOverlay)
         map.overlays.add(fogOverlay)
+        map.overlays.add(cityBoundaryOverlay)
     }
 
     private fun updateTrackingButton() {
