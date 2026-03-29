@@ -76,6 +76,8 @@ class MainActivity : AppCompatActivity() {
     private var lastResolvedCityName: String? = null
     private var lastLoadedCityBoundaryKey: String? = null
     private var currentCityBoundary: CityBoundary? = null
+    private var currentProjectedCityBoundary: ProjectedBoundary? = null
+    private var currentCityBoundaryCellCount: Int? = null
     private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val cityResolverExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val pointsRefreshHandler = Handler(Looper.getMainLooper())
@@ -286,6 +288,8 @@ class MainActivity : AppCompatActivity() {
             } else {
                 null
             }
+            val projectedBoundary = boundary?.let(::projectBoundaryToMercator)
+            val boundaryCellCount = projectedBoundary?.let(::countCellsInBoundary)
 
             runOnUiThread {
                 if (cityName != lastResolvedCityName) {
@@ -296,6 +300,8 @@ class MainActivity : AppCompatActivity() {
                 if (boundary != null) {
                     lastLoadedCityBoundaryKey = cityName
                     currentCityBoundary = boundary
+                    currentProjectedCityBoundary = projectedBoundary
+                    currentCityBoundaryCellCount = boundaryCellCount
                     cityBoundaryOverlay.setPoints(boundary.outerRing)
                     cityBoundaryOverlay.setHoles(boundary.holes)
                     cityBoundaryOverlay.isVisible = true
@@ -423,14 +429,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateDiscoveredPercentage() {
-        val boundary = currentCityBoundary ?: run {
+        val projectedBoundary = currentProjectedCityBoundary
+        val boundaryCellCount = currentCityBoundaryCellCount
+        if (projectedBoundary == null || boundaryCellCount == null) {
             discoveredPercentText.text = getString(R.string.discovered_percent_default)
             return
         }
 
         databaseExecutor.execute {
             val percentage = computeDiscoveredPercentage(
-                boundary,
+                projectedBoundary,
+                boundaryCellCount,
                 locationHistoryDatabase.getAllCells()
             )
             val formattedPercentage = String.format(Locale.US, "%.3f%%", percentage)
@@ -442,12 +451,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun computeDiscoveredPercentage(
-        boundary: CityBoundary,
+        projectedBoundary: ProjectedBoundary,
+        totalCellsInBoundary: Int,
         discoveredCells: List<LocationHistoryDatabase.StoredGridCell>
     ): Double {
-        if (discoveredCells.isEmpty()) return 0.0
+        var discoveredCellsInBoundary = 0
 
-        val projectedBoundary = ProjectedBoundary(
+        for (cell in discoveredCells) {
+            val cellCenter = ProjectedPoint(
+                x = (cell.column + 0.5) * GRID_CELL_SIZE_METERS,
+                y = (cell.row + 0.5) * GRID_CELL_SIZE_METERS
+            )
+            if (isInsideBoundary(cellCenter, projectedBoundary)) {
+                discoveredCellsInBoundary += 1
+            }
+        }
+
+        if (totalCellsInBoundary == 0) return 0.0
+        return 100.0 * discoveredCellsInBoundary / totalCellsInBoundary
+    }
+
+    private fun projectBoundaryToMercator(boundary: CityBoundary): ProjectedBoundary {
+        return ProjectedBoundary(
             outerRing = boundary.outerRing.map {
                 ProjectedPoint(
                     x = longitudeToWebMercatorX(it.longitude),
@@ -463,33 +488,27 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         )
-        val bounds = computeBounds(projectedBoundary.outerRing) ?: return 0.0
-        val discoveredCellSet = discoveredCells.map { it.column to it.row }.toHashSet()
+    }
+
+    private fun countCellsInBoundary(projectedBoundary: ProjectedBoundary): Int {
+        val bounds = computeBounds(projectedBoundary.outerRing) ?: return 0
         val minColumn = kotlin.math.floor(bounds.minX / GRID_CELL_SIZE_METERS).toLong()
         val maxColumn = kotlin.math.ceil(bounds.maxX / GRID_CELL_SIZE_METERS).toLong()
         val minRow = kotlin.math.floor(bounds.minY / GRID_CELL_SIZE_METERS).toLong()
         val maxRow = kotlin.math.ceil(bounds.maxY / GRID_CELL_SIZE_METERS).toLong()
         var totalCellsInBoundary = 0
-        var discoveredCellsInBoundary = 0
 
         for (column in minColumn..maxColumn) {
             val centerX = (column + 0.5) * GRID_CELL_SIZE_METERS
             for (row in minRow..maxRow) {
                 val centerY = (row + 0.5) * GRID_CELL_SIZE_METERS
-                val cellCenter = ProjectedPoint(centerX, centerY)
-                if (!isInsideBoundary(cellCenter, projectedBoundary)) {
-                    continue
-                }
-
-                totalCellsInBoundary += 1
-                if ((column to row) in discoveredCellSet) {
-                    discoveredCellsInBoundary += 1
+                if (isInsideBoundary(ProjectedPoint(centerX, centerY), projectedBoundary)) {
+                    totalCellsInBoundary += 1
                 }
             }
         }
 
-        if (totalCellsInBoundary == 0) return 0.0
-        return 100.0 * discoveredCellsInBoundary / totalCellsInBoundary
+        return totalCellsInBoundary
     }
 
     private fun computeBounds(points: List<ProjectedPoint>): Bounds? {
