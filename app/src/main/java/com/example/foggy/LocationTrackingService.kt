@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -116,10 +117,21 @@ class LocationTrackingService : Service() {
 
     private fun buildNotification(): Notification {
         val intervalSeconds = (LOCATION_SAVE_INTERVAL_MS / 1_000L).toInt()
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openAppPendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.tracking_notification_title))
             .setContentText(getString(R.string.tracking_notification_text, intervalSeconds))
             .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentIntent(openAppPendingIntent)
             .setOngoing(true)
             .build()
     }
