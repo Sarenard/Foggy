@@ -42,6 +42,10 @@ import kotlin.math.cos
 import kotlin.math.pow
 
 class MainActivity : AppCompatActivity() {
+    private companion object {
+        private const val TRACKING_START_ZOOM_LEVEL = 20.0
+    }
+
 
     companion object {
         private const val LOCATION_PERMISSION_REQUEST_CODE = 1
@@ -275,6 +279,7 @@ class MainActivity : AppCompatActivity() {
     private fun centerMapOnGps(myLocation: GeoPoint) {
         if (hasCenteredOnGps) return
 
+        map.controller.setZoom(TRACKING_START_ZOOM_LEVEL)
         map.controller.animateTo(myLocation)
         hasCenteredOnGps = true
     }
