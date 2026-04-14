@@ -44,10 +44,6 @@ import kotlin.math.pow
 class MainActivity : AppCompatActivity() {
     private companion object {
         private const val TRACKING_START_ZOOM_LEVEL = 20.0
-    }
-
-
-    companion object {
         private const val LOCATION_PERMISSION_REQUEST_CODE = 1
         private const val BACKGROUND_LOCATION_PERMISSION_REQUEST_CODE = 2
         private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 3
