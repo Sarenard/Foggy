@@ -27,6 +27,10 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 import android.location.Geocoder
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowInsets
+import androidx.core.view.marginTop
 import org.json.JSONArray
 import org.json.JSONObject
 import org.osmdroid.config.Configuration
@@ -135,6 +139,25 @@ class MainActivity : AppCompatActivity() {
             useBlackFog = !useBlackFog
             updateFogModeButton()
             map.invalidate()
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val topButtonRepositionListener: (View, WindowInsets) -> WindowInsets = { view, windowInsets ->
+
+                val padding = windowInsets.getInsets(WindowInsets.Type.statusBars()).top
+
+                // Get the LayoutParams of the button
+                val layoutParams = view.layoutParams as ViewGroup.MarginLayoutParams
+
+                // Set the top margin for the button to avoid the status bar
+                layoutParams.topMargin = padding
+
+                // Apply the new LayoutParams back to the button
+                view.layoutParams = layoutParams
+                windowInsets
+            }
+            fogModeButton.setOnApplyWindowInsetsListener(topButtonRepositionListener)
+            trackingButton.setOnApplyWindowInsetsListener(topButtonRepositionListener)
         }
 
         refreshSavedPoints()
