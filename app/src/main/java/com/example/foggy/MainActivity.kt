@@ -70,6 +70,10 @@ class MainActivity : AppCompatActivity() {
         Normal, Insertion, Deletion, BulkInsertion, BulkDeletion
     }
 
+    enum class FogMode {
+        Normal, Black, Status
+    }
+
     private lateinit var map: MapView
     private lateinit var fogModeButton: Button
     private lateinit var trackingControlsContainer: LinearLayout
@@ -84,7 +88,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cityBoundaryOverlay: Polygon
     private lateinit var fogOverlay: FogOverlay
     private var locationOverlay: MyLocationNewOverlay? = null
-    private var useBlackFog = true
+    private var fogMode = FogMode.Black
     private var editMode = EditMode.Normal
     private var hasCenteredOnSavedPoint = false
     private var hasCenteredOnGps = false
@@ -151,7 +155,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         fogModeButton.setOnClickListener {
-            useBlackFog = !useBlackFog
+            fogMode = when (fogMode) {
+                FogMode.Normal -> FogMode.Black
+                FogMode.Black -> FogMode.Status
+                FogMode.Status -> FogMode.Normal
+            }
             updateFogModeButton()
             map.invalidate()
         }
@@ -763,10 +771,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateFogModeButton() {
-        fogModeButton.text = if (useBlackFog) {
-            getString(R.string.show_default_fog)
-        } else {
-            getString(R.string.show_black_fog)
+        fogModeButton.text = when (fogMode) {
+            FogMode.Normal -> getString(R.string.showing_default_fog)
+            FogMode.Black -> getString(R.string.showing_black_fog)
+            FogMode.Status -> getString(R.string.showing_status_fog)
         }
     }
 
@@ -903,9 +911,8 @@ class MainActivity : AppCompatActivity() {
         private val fogPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
         }
-
         private val clearPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
         }
         private val statePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
@@ -913,13 +920,10 @@ class MainActivity : AppCompatActivity() {
 
         override fun draw(canvas: Canvas, mapView: MapView, shadow: Boolean) {
             if (shadow) return
-
-            fogPaint.color = if (useBlackFog) {
-                Color.argb(255, 0, 0, 0)
-            } else {
-                Color.argb(210, 215, 220, 225)
+            fogPaint.color = when (fogMode) {
+                FogMode.Normal -> Color.argb(170, 148, 152, 158)
+                FogMode.Black, FogMode.Status -> Color.argb(255, 0, 0, 0)
             }
-
             val layerId = canvas.saveLayer(
                 0f,
                 0f,
@@ -927,7 +931,6 @@ class MainActivity : AppCompatActivity() {
                 mapView.height.toFloat(),
                 null
             )
-
             canvas.drawRect(
                 0f,
                 0f,
@@ -935,14 +938,11 @@ class MainActivity : AppCompatActivity() {
                 mapView.height.toFloat(),
                 fogPaint
             )
-
             drawRevealedGridCells(canvas, mapView)
-
             canvas.restoreToCount(layerId)
         }
 
         private fun drawRevealedGridCells(canvas: Canvas, mapView: MapView) {
-            clearPaint.shader = null
             val screenWidth = mapView.width.toFloat()
             val screenHeight = mapView.height.toFloat()
             val visibleBounds = visibleBounds(mapView)
@@ -976,22 +976,48 @@ class MainActivity : AppCompatActivity() {
                     continue
                 }
 
-                when (cell.editState) {
-                    LocationHistoryDatabase.EDIT_STATE_NORMAL -> {
-                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
-                    }
+                if (isTransparentCell(cell.editState)) {
+                    canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
+                } else {
+                    statePaint.color = colorForCell(cell.editState)
+                    canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, statePaint)
+                }
+            }
+        }
 
-                    LocationHistoryDatabase.EDIT_STATE_ADDED_BY_EDIT -> {
-                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
-                        statePaint.color = Color.argb(52, 76, 175, 80)
-                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, statePaint)
-                    }
+        private fun isTransparentCell(editState: Int): Boolean {
+            return when (fogMode) {
+                FogMode.Normal -> when (editState) {
+                    LocationHistoryDatabase.EDIT_STATE_NORMAL,
+                    LocationHistoryDatabase.EDIT_STATE_ADDED_BY_EDIT -> true
+                    else -> false
+                }
 
-                    LocationHistoryDatabase.EDIT_STATE_REMOVED_BY_EDIT -> {
-                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
-                        statePaint.color = Color.argb(56, 211, 47, 47)
-                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, statePaint)
-                    }
+                FogMode.Black -> when (editState) {
+                    LocationHistoryDatabase.EDIT_STATE_NORMAL,
+                    LocationHistoryDatabase.EDIT_STATE_ADDED_BY_EDIT -> true
+                    else -> false
+                }
+
+                FogMode.Status -> when (editState) {
+                    LocationHistoryDatabase.EDIT_STATE_NORMAL -> true
+                    else -> false
+                }
+            }
+        }
+
+        private fun colorForCell(editState: Int): Int {
+            return when (fogMode) {
+                FogMode.Normal -> when (editState) {
+                    else -> Color.argb(170, 148, 152, 158)
+                }
+
+                FogMode.Black -> Color.argb(255, 0, 0, 0)
+
+                FogMode.Status -> when (editState) {
+                    LocationHistoryDatabase.EDIT_STATE_ADDED_BY_EDIT -> Color.argb(170, 76, 175, 80)
+                    LocationHistoryDatabase.EDIT_STATE_REMOVED_BY_EDIT -> Color.argb(170, 211, 47, 47)
+                    else -> Color.argb(255, 0, 0, 0)
                 }
             }
         }

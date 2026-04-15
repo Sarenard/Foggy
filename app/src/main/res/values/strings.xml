@@ -4,11 +4,15 @@
     <string name="stop_tracking">Stop tracking</string>
     <string name="show_black_fog">Show black</string>
     <string name="show_default_fog">Show normal</string>
+    <string name="show_status_fog">Show status</string>
+    <string name="showing_black_fog">Showing black</string>
+    <string name="showing_default_fog">Showing normal</string>
+    <string name="showing_status_fog">Showing status</string>
     <string name="current_city_unknown">Unknown city</string>
     <string name="discovered_percent_default">0.000%</string>
     <string name="tracking_notification_title">Foggy tracking active</string>
     <string name="tracking_notification_text">Saving GPS points every %1$d seconds.</string>
-    <string name="edit_mode_normal">Normal</string>
+    <string name="edit_mode_normal">GPS mode</string>
     <string name="edit_mode_insert">Insert</string>
     <string name="edit_mode_delete">Delete</string>
     <string name="edit_mode_bulk_insert">Bulk Add</string>
