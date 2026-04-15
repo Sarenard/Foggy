@@ -298,8 +298,7 @@ class MainActivity : AppCompatActivity() {
     private fun centerMapOnGps(myLocation: GeoPoint) {
         if (hasCenteredOnGps) return
 
-        map.controller.setZoom(TRACKING_START_ZOOM_LEVEL)
-        map.controller.animateTo(myLocation)
+        map.controller.animateTo(myLocation, TRACKING_START_ZOOM_LEVEL, 1000L)
         hasCenteredOnGps = true
     }
 
