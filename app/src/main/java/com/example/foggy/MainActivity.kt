@@ -17,9 +17,12 @@ import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
 import android.view.View
+<<<<<<< HEAD
 import android.location.Geocoder
 import android.view.ViewGroup
 import android.view.WindowInsets
+=======
+>>>>>>> 5fe1952cdac33227ca4bed8ec989933f93673bcf
 import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
