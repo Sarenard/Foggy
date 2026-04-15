@@ -28,6 +28,12 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
         val longitude: Double
     )
 
+    data class StoredGridCellWithState(
+        val column: Long,
+        val row: Long,
+        val editState: Int
+    )
+
     override fun onCreate(db: SQLiteDatabase) {
         createGridCellsTable(db)
     }
@@ -45,6 +51,11 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
                 2 -> {
                     migrateSingleCellsToRevealedCells(db)
                     version = 3
+                }
+
+                3 -> {
+                    addEditStateColumn(db)
+                    version = 4
                 }
 
                 else -> {
@@ -70,46 +81,41 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
         }
 
         val cells = revealedCellsAround(latitude, longitude)
-        writableDatabase.beginTransaction()
+        val db = writableDatabase
+        db.beginTransaction()
         try {
             for (cell in cells) {
-                insertGridCell(
-                    db = writableDatabase,
-                    tableName = TABLE_POINTS,
-                    cell = cell,
-                    recordedAt = recordedAt
-                )
+                upsertGpsCell(db, cell, recordedAt)
             }
-            writableDatabase.setTransactionSuccessful()
+            db.setTransactionSuccessful()
         } finally {
-            writableDatabase.endTransaction()
+            db.endTransaction()
         }
     }
 
-    fun insertManualPoint(latitude: Double, longitude: Double) {
-        insertPoint(
-            latitude = latitude,
-            longitude = longitude,
-            altitude = 0.0,
-            accuracy = 0f,
-            recordedAt = System.currentTimeMillis()
-        )
+    fun deleteNearPoint(latitude: Double, longitude: Double) {
+        val cell = latLonToGridCell(latitude, longitude)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            applyEditDeletion(db, cell)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
-    fun deleteNearPoint(latitude: Double, longitude: Double) {
+    fun deleteNearPointBulk(latitude: Double, longitude: Double) {
         val cells = revealedCellsAround(latitude, longitude)
-        writableDatabase.beginTransaction()
+        val db = writableDatabase
+        db.beginTransaction()
         try {
             for (cell in cells) {
-                writableDatabase.delete(
-                    TABLE_POINTS,
-                    "$COLUMN_GRID_COLUMN = ? AND $COLUMN_GRID_ROW = ?",
-                    arrayOf(cell.column.toString(), cell.row.toString())
-                )
+                applyEditDeletion(db, cell)
             }
-            writableDatabase.setTransactionSuccessful()
+            db.setTransactionSuccessful()
         } finally {
-            writableDatabase.endTransaction()
+            db.endTransaction()
         }
     }
 
@@ -118,9 +124,15 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
     }
 
     fun getAllCells(): List<StoredGridCell> {
-        val cells = mutableListOf<StoredGridCell>()
+        return getAllCellsWithState()
+            .filter { it.editState != EDIT_STATE_REMOVED_BY_EDIT }
+            .map { StoredGridCell(column = it.column, row = it.row) }
+    }
+
+    fun getAllCellsWithState(): List<StoredGridCellWithState> {
+        val cells = mutableListOf<StoredGridCellWithState>()
         val query = """
-            SELECT $COLUMN_GRID_COLUMN, $COLUMN_GRID_ROW
+            SELECT $COLUMN_GRID_COLUMN, $COLUMN_GRID_ROW, $COLUMN_EDIT_STATE
             FROM $TABLE_POINTS
             ORDER BY $COLUMN_RECORDED_AT ASC
         """.trimIndent()
@@ -128,12 +140,14 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
         readableDatabase.rawQuery(query, null).use { cursor ->
             val columnIndex = cursor.getColumnIndexOrThrow(COLUMN_GRID_COLUMN)
             val rowIndex = cursor.getColumnIndexOrThrow(COLUMN_GRID_ROW)
+            val editStateIndex = cursor.getColumnIndexOrThrow(COLUMN_EDIT_STATE)
 
             while (cursor.moveToNext()) {
                 cells.add(
-                    StoredGridCell(
+                    StoredGridCellWithState(
                         column = cursor.getLong(columnIndex),
-                        row = cursor.getLong(rowIndex)
+                        row = cursor.getLong(rowIndex),
+                        editState = cursor.getInt(editStateIndex)
                     )
                 )
             }
@@ -142,10 +156,15 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
         return cells
     }
 
+    fun gridCellToLatLon(column: Long, row: Long): StoredLocationPoint {
+        return gridCellToLatLon(StoredGridCell(column = column, row = row))
+    }
+
     fun getLastPoint(): StoredLocationPoint? {
         val query = """
             SELECT $COLUMN_GRID_COLUMN, $COLUMN_GRID_ROW
             FROM $TABLE_POINTS
+            WHERE $COLUMN_EDIT_STATE != $EDIT_STATE_REMOVED_BY_EDIT
             ORDER BY $COLUMN_RECORDED_AT DESC
             LIMIT 1
         """.trimIndent()
@@ -172,8 +191,18 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
                 $COLUMN_GRID_COLUMN INTEGER NOT NULL,
                 $COLUMN_GRID_ROW INTEGER NOT NULL,
                 $COLUMN_RECORDED_AT INTEGER NOT NULL,
+                $COLUMN_EDIT_STATE INTEGER NOT NULL DEFAULT $EDIT_STATE_NORMAL,
                 UNIQUE($COLUMN_GRID_COLUMN, $COLUMN_GRID_ROW)
             )
+            """.trimIndent()
+        )
+    }
+
+    private fun addEditStateColumn(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            ALTER TABLE $TABLE_POINTS
+            ADD COLUMN $COLUMN_EDIT_STATE INTEGER NOT NULL DEFAULT $EDIT_STATE_NORMAL
             """.trimIndent()
         )
     }
@@ -256,12 +285,14 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
         db: SQLiteDatabase,
         tableName: String,
         cell: StoredGridCell,
-        recordedAt: Long
+        recordedAt: Long,
+        editState: Int = EDIT_STATE_NORMAL
     ) {
         val values = ContentValues().apply {
             put(COLUMN_GRID_COLUMN, cell.column)
             put(COLUMN_GRID_ROW, cell.row)
             put(COLUMN_RECORDED_AT, recordedAt)
+            put(COLUMN_EDIT_STATE, editState)
         }
 
         db.insertWithOnConflict(
@@ -269,6 +300,130 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
             null,
             values,
             SQLiteDatabase.CONFLICT_REPLACE
+        )
+    }
+
+    private fun upsertGpsCell(
+        db: SQLiteDatabase,
+        cell: StoredGridCell,
+        recordedAt: Long
+    ) {
+        when (getExistingEditState(db, cell)) {
+            null -> insertGridCell(db, TABLE_POINTS, cell, recordedAt, EDIT_STATE_NORMAL)
+            EDIT_STATE_NORMAL -> Unit
+            EDIT_STATE_ADDED_BY_EDIT,
+            EDIT_STATE_REMOVED_BY_EDIT -> updateCell(db, cell, recordedAt, EDIT_STATE_NORMAL)
+            else -> Unit
+        }
+    }
+
+    fun insertManualPoint(latitude: Double, longitude: Double) {
+        val cell = latLonToGridCell(latitude, longitude)
+        val recordedAt = System.currentTimeMillis()
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            applyEditInsertion(db, cell, recordedAt)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun insertManualPointBulk(latitude: Double, longitude: Double) {
+        val cells = revealedCellsAround(latitude, longitude)
+        val recordedAt = System.currentTimeMillis()
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            for (cell in cells) {
+                applyEditInsertion(db, cell, recordedAt)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    private fun applyEditInsertion(
+        db: SQLiteDatabase,
+        cell: StoredGridCell,
+        recordedAt: Long
+    ) {
+        when (getExistingEditState(db, cell)) {
+            null -> insertGridCell(db, TABLE_POINTS, cell, recordedAt, EDIT_STATE_ADDED_BY_EDIT)
+            EDIT_STATE_NORMAL -> Unit
+            EDIT_STATE_ADDED_BY_EDIT -> Unit
+            EDIT_STATE_REMOVED_BY_EDIT -> updateCell(db, cell, recordedAt, EDIT_STATE_NORMAL)
+            else -> Unit
+        }
+    }
+
+    private fun applyEditDeletion(db: SQLiteDatabase, cell: StoredGridCell) {
+        when (getExistingEditState(db, cell)) {
+            null -> Unit
+            EDIT_STATE_NORMAL -> updateCellEditState(db, cell, EDIT_STATE_REMOVED_BY_EDIT)
+            EDIT_STATE_ADDED_BY_EDIT -> deleteCell(db, cell)
+            EDIT_STATE_REMOVED_BY_EDIT -> Unit
+            else -> Unit
+        }
+    }
+
+    private fun getExistingEditState(db: SQLiteDatabase, cell: StoredGridCell): Int? {
+        val query = """
+            SELECT $COLUMN_EDIT_STATE
+            FROM $TABLE_POINTS
+            WHERE $COLUMN_GRID_COLUMN = ? AND $COLUMN_GRID_ROW = ?
+            LIMIT 1
+        """.trimIndent()
+
+        db.rawQuery(query, arrayOf(cell.column.toString(), cell.row.toString())).use { cursor ->
+            if (!cursor.moveToFirst()) return null
+            return cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_EDIT_STATE))
+        }
+    }
+
+    private fun updateCell(
+        db: SQLiteDatabase,
+        cell: StoredGridCell,
+        recordedAt: Long,
+        editState: Int
+    ) {
+        val values = ContentValues().apply {
+            put(COLUMN_RECORDED_AT, recordedAt)
+            put(COLUMN_EDIT_STATE, editState)
+        }
+
+        db.update(
+            TABLE_POINTS,
+            values,
+            "$COLUMN_GRID_COLUMN = ? AND $COLUMN_GRID_ROW = ?",
+            arrayOf(cell.column.toString(), cell.row.toString())
+        )
+    }
+
+    private fun updateCellEditState(
+        db: SQLiteDatabase,
+        cell: StoredGridCell,
+        editState: Int
+    ) {
+        val values = ContentValues().apply {
+            put(COLUMN_EDIT_STATE, editState)
+        }
+
+        db.update(
+            TABLE_POINTS,
+            values,
+            "$COLUMN_GRID_COLUMN = ? AND $COLUMN_GRID_ROW = ?",
+            arrayOf(cell.column.toString(), cell.row.toString())
+        )
+    }
+
+    private fun deleteCell(db: SQLiteDatabase, cell: StoredGridCell) {
+        db.delete(
+            TABLE_POINTS,
+            "$COLUMN_GRID_COLUMN = ? AND $COLUMN_GRID_ROW = ?",
+            arrayOf(cell.column.toString(), cell.row.toString())
         )
     }
 
@@ -346,7 +501,7 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
 
     companion object {
         private const val DATABASE_NAME = "location_history.db"
-        private const val DATABASE_VERSION = 3
+        private const val DATABASE_VERSION = 4
         private const val GRID_CELL_SIZE_METERS = 15.0
         private const val REVEAL_RADIUS_METERS = 15.0
         private const val WEB_MERCATOR_HALF_WORLD_METERS = 20_037_508.342789244
@@ -357,5 +512,10 @@ class LocationHistoryDatabase(context: Context) : SQLiteOpenHelper(
         const val COLUMN_RECORDED_AT = "recorded_at"
         const val COLUMN_GRID_COLUMN = "grid_column"
         const val COLUMN_GRID_ROW = "grid_row"
+        const val COLUMN_EDIT_STATE = "edit_state"
+
+        const val EDIT_STATE_NORMAL = 0
+        const val EDIT_STATE_ADDED_BY_EDIT = 1
+        const val EDIT_STATE_REMOVED_BY_EDIT = 2
     }
 }

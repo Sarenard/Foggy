@@ -15,14 +15,13 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.location.Geocoder
 import android.view.MotionEvent
 import android.view.View
-<<<<<<< HEAD
-import android.location.Geocoder
+import android.view.ViewConfiguration
+import android.widget.LinearLayout
 import android.view.ViewGroup
 import android.view.WindowInsets
-=======
->>>>>>> 5fe1952cdac33227ca4bed8ec989933f93673bcf
 import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -68,11 +67,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     enum class EditMode {
-        Normal, Insertion, Deletion
+        Normal, Insertion, Deletion, BulkInsertion, BulkDeletion
     }
 
     private lateinit var map: MapView
     private lateinit var fogModeButton: Button
+    private lateinit var trackingControlsContainer: LinearLayout
     private lateinit var trackingButton: Button
     private lateinit var editButton: Button
     private lateinit var discoveredPercentText: TextView
@@ -95,8 +95,12 @@ class MainActivity : AppCompatActivity() {
     private var currentProjectedCityBoundary: ProjectedBoundary? = null
     private var currentCityBoundaryCellCount: Int? = null
     private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val percentageExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val cityResolverExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val pointsRefreshHandler = Handler(Looper.getMainLooper())
+    private val refreshLock = Any()
+    @Volatile private var refreshInFlight = false
+    @Volatile private var refreshQueued = false
     private val pointsRefresher = object : Runnable {
         override fun run() {
             refreshSavedPoints()
@@ -116,6 +120,7 @@ class MainActivity : AppCompatActivity() {
 
         map = findViewById(R.id.map)
         fogModeButton = findViewById(R.id.fogModeButton)
+        trackingControlsContainer = findViewById(R.id.trackingControlsContainer)
         trackingButton = findViewById(R.id.trackingButton)
         editButton = findViewById(R.id.editButton)
         discoveredPercentText = findViewById(R.id.discoveredPercentText)
@@ -161,15 +166,16 @@ class MainActivity : AppCompatActivity() {
                 windowInsets
             }
             fogModeButton.setOnApplyWindowInsetsListener(topButtonRepositionListener)
-            trackingButton.setOnApplyWindowInsetsListener(topButtonRepositionListener)
-            editButton.setOnApplyWindowInsetsListener(topButtonRepositionListener)
+            trackingControlsContainer.setOnApplyWindowInsetsListener(topButtonRepositionListener)
         }
 
         editButton.setOnClickListener {
             editMode = when (editMode) {
                 EditMode.Normal -> EditMode.Insertion
                 EditMode.Insertion -> EditMode.Deletion
-                EditMode.Deletion -> EditMode.Normal
+                EditMode.Deletion -> EditMode.BulkInsertion
+                EditMode.BulkInsertion -> EditMode.BulkDeletion
+                EditMode.BulkDeletion -> EditMode.Normal
             }
             updateEditModeUi()
         }
@@ -273,14 +279,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshSavedPoints() {
-        databaseExecutor.execute {
-            val points = locationHistoryDatabase.getAllPoints()
-            runOnUiThread {
-                savedPointsOverlay.setPoints(points)
-                updateCurrentCityFromLocation(locationOverlay?.myLocation)
-                updateDiscoveredPercentage()
-                map.invalidate()
+        synchronized(refreshLock) {
+            if (refreshInFlight) {
+                refreshQueued = true
+                return
             }
+            refreshInFlight = true
+        }
+
+        runSavedPointsRefresh()
+    }
+
+    private fun runSavedPointsRefresh() {
+        databaseExecutor.execute {
+            val cells = locationHistoryDatabase.getAllCellsWithState()
+            runOnUiThread {
+                try {
+                    savedPointsOverlay.setCells(cells)
+                    updateCurrentCityFromLocation(locationOverlay?.myLocation)
+                    updateDiscoveredPercentage(cells)
+                    map.invalidate()
+                } finally {
+                    scheduleQueuedRefreshIfNeeded()
+                }
+            }
+        }
+    }
+
+    private fun scheduleQueuedRefreshIfNeeded() {
+        val shouldRunAnotherRefresh = synchronized(refreshLock) {
+            if (refreshQueued) {
+                refreshQueued = false
+                true
+            } else {
+                refreshInFlight = false
+                false
+            }
+        }
+
+        if (shouldRunAnotherRefresh) {
+            runSavedPointsRefresh()
         }
     }
 
@@ -486,10 +524,42 @@ class MainActivity : AppCompatActivity() {
         }
 
         databaseExecutor.execute {
+            updateDiscoveredPercentage(
+                locationHistoryDatabase.getAllCellsWithState(),
+                projectedBoundary,
+                boundaryCellCount
+            )
+        }
+    }
+
+    private fun updateDiscoveredPercentage(
+        cells: List<LocationHistoryDatabase.StoredGridCellWithState>
+    ) {
+        val projectedBoundary = currentProjectedCityBoundary
+        val boundaryCellCount = currentCityBoundaryCellCount
+        if (projectedBoundary == null || boundaryCellCount == null) {
+            discoveredPercentText.text = getString(R.string.discovered_percent_default)
+            return
+        }
+
+        updateDiscoveredPercentage(cells, projectedBoundary, boundaryCellCount)
+    }
+
+    private fun updateDiscoveredPercentage(
+        cells: List<LocationHistoryDatabase.StoredGridCellWithState>,
+        projectedBoundary: ProjectedBoundary,
+        boundaryCellCount: Int
+    ) {
+        val discoveredCells = cells.asSequence()
+            .filter { it.editState != LocationHistoryDatabase.EDIT_STATE_REMOVED_BY_EDIT }
+            .map { LocationHistoryDatabase.StoredGridCell(column = it.column, row = it.row) }
+            .toList()
+
+        percentageExecutor.execute {
             val percentage = computeDiscoveredPercentage(
                 projectedBoundary,
                 boundaryCellCount,
-                locationHistoryDatabase.getAllCells()
+                discoveredCells
             )
             val formattedPercentage = String.format(Locale.US, "%.3f%%", percentage)
 
@@ -705,6 +775,8 @@ class MainActivity : AppCompatActivity() {
             EditMode.Normal -> getString(R.string.edit_mode_normal)
             EditMode.Insertion -> getString(R.string.edit_mode_insert)
             EditMode.Deletion -> getString(R.string.edit_mode_delete)
+            EditMode.BulkInsertion -> getString(R.string.edit_mode_bulk_insert)
+            EditMode.BulkDeletion -> getString(R.string.edit_mode_bulk_delete)
         }
     }
 
@@ -750,6 +822,7 @@ class MainActivity : AppCompatActivity() {
         disableLocationOverlay()
         locationHistoryDatabase.close()
         databaseExecutor.shutdown()
+        percentageExecutor.shutdown()
         cityResolverExecutor.shutdown()
         super.onDestroy()
     }
@@ -759,21 +832,26 @@ class MainActivity : AppCompatActivity() {
             color = Color.RED
             style = Paint.Style.FILL
         }
-        private var points: List<LocationHistoryDatabase.StoredLocationPoint> = emptyList()
+        private var cells: List<LocationHistoryDatabase.StoredGridCellWithState> = emptyList()
 
-        fun setPoints(newPoints: List<LocationHistoryDatabase.StoredLocationPoint>) {
-            points = newPoints
+        fun setCells(newCells: List<LocationHistoryDatabase.StoredGridCellWithState>) {
+            cells = newCells
         }
 
-        fun getPoints(): List<LocationHistoryDatabase.StoredLocationPoint> = points
+        fun getCells(): List<LocationHistoryDatabase.StoredGridCellWithState> = cells
 
         override fun draw(canvas: Canvas, mapView: MapView, shadow: Boolean) {
-            if (shadow || !SHOW_SAVED_POINTS || points.isEmpty()) return
+            if (shadow || !SHOW_SAVED_POINTS || cells.isEmpty()) return
 
             val width = mapView.width.toFloat()
             val height = mapView.height.toFloat()
 
-            for (point in points) {
+            for (cell in cells) {
+                if (cell.editState == LocationHistoryDatabase.EDIT_STATE_REMOVED_BY_EDIT) {
+                    continue
+                }
+
+                val point = gridCellCenter(cell)
                 val geoPoint = GeoPoint(point.latitude, point.longitude)
                 val screenPoint = mapView.projection.toPixels(geoPoint, null)
                 val radiusPixels = metersToPixels(
@@ -800,6 +878,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        private fun gridCellCenter(
+            cell: LocationHistoryDatabase.StoredGridCellWithState
+        ): LocationHistoryDatabase.StoredLocationPoint {
+            val centerX = (cell.column + 0.5) * GRID_CELL_SIZE_METERS
+            val centerY = (cell.row + 0.5) * GRID_CELL_SIZE_METERS
+            val latitude =
+                Math.toDegrees(2.0 * kotlin.math.atan(kotlin.math.exp(centerY / 6_378_137.0)) - Math.PI / 2.0)
+            val longitude = (centerX / WEB_MERCATOR_HALF_WORLD_METERS) * 180.0
+            return LocationHistoryDatabase.StoredLocationPoint(
+                latitude = latitude,
+                longitude = longitude
+            )
+        }
+
         private fun metersToPixels(meters: Double, latitude: Double, zoomLevel: Double): Double {
             val metersPerPixel =
                 156543.03392 * cos(Math.toRadians(latitude)) / 2.0.pow(zoomLevel)
@@ -814,6 +906,9 @@ class MainActivity : AppCompatActivity() {
 
         private val clearPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+        }
+        private val statePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
         }
 
         override fun draw(canvas: Canvas, mapView: MapView, shadow: Boolean) {
@@ -852,18 +947,15 @@ class MainActivity : AppCompatActivity() {
             val screenHeight = mapView.height.toFloat()
             val visibleBounds = visibleBounds(mapView)
 
-            for (point in savedPointsOverlay.getPoints()) {
-                if (!visibleBounds.contains(point.latitude, point.longitude)) {
+            for (cell in savedPointsOverlay.getCells()) {
+                val cellCenter = gridCellCenter(cell)
+                if (!visibleBounds.contains(cellCenter.latitude, cellCenter.longitude)) {
                     continue
                 }
 
-                val pointX = longitudeToWebMercatorX(point.longitude)
-                val pointY = latitudeToWebMercatorY(point.latitude)
-                val column = kotlin.math.floor(pointX / GRID_CELL_SIZE_METERS).toLong()
-                val row = kotlin.math.floor(pointY / GRID_CELL_SIZE_METERS).toLong()
-                val left = column * GRID_CELL_SIZE_METERS
+                val left = cell.column * GRID_CELL_SIZE_METERS
                 val right = left + GRID_CELL_SIZE_METERS
-                val top = row * GRID_CELL_SIZE_METERS
+                val top = cell.row * GRID_CELL_SIZE_METERS
                 val bottom = top + GRID_CELL_SIZE_METERS
 
                 val topLeft = mapView.projection.toPixels(
@@ -884,8 +976,35 @@ class MainActivity : AppCompatActivity() {
                     continue
                 }
 
-                canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
+                when (cell.editState) {
+                    LocationHistoryDatabase.EDIT_STATE_NORMAL -> {
+                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
+                    }
+
+                    LocationHistoryDatabase.EDIT_STATE_ADDED_BY_EDIT -> {
+                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
+                        statePaint.color = Color.argb(52, 76, 175, 80)
+                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, statePaint)
+                    }
+
+                    LocationHistoryDatabase.EDIT_STATE_REMOVED_BY_EDIT -> {
+                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, clearPaint)
+                        statePaint.color = Color.argb(56, 211, 47, 47)
+                        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, statePaint)
+                    }
+                }
             }
+        }
+
+        private fun gridCellCenter(
+            cell: LocationHistoryDatabase.StoredGridCellWithState
+        ): LocationHistoryDatabase.StoredLocationPoint {
+            val centerX = (cell.column + 0.5) * GRID_CELL_SIZE_METERS
+            val centerY = (cell.row + 0.5) * GRID_CELL_SIZE_METERS
+            return LocationHistoryDatabase.StoredLocationPoint(
+                latitude = webMercatorYToLatitude(centerY),
+                longitude = webMercatorXToLongitude(centerX)
+            )
         }
 
         private fun visibleBounds(mapView: MapView): VisibleBounds {
@@ -1031,35 +1150,95 @@ class MainActivity : AppCompatActivity() {
     }
 
     private inner class EditModeOverlay : Overlay() {
+        private val touchSlop by lazy { ViewConfiguration.get(this@MainActivity).scaledTouchSlop }
+        private var downX = 0f
+        private var downY = 0f
+        private var moved = false
+
+        private fun runEditActionAndRefresh(action: () -> Unit) {
+            databaseExecutor.execute {
+                action()
+                runOnUiThread { refreshSavedPoints() }
+            }
+        }
+
         override fun onTouchEvent(e: MotionEvent, mapView: MapView): Boolean {
-            when (editMode) {
-                EditMode.Normal -> return false
-                EditMode.Insertion -> {
-                    val geoPoint =
-                        mapView.projection.fromPixels(e.x.toInt(), e.y.toInt()) as GeoPoint
-                    databaseExecutor.execute {
-                        locationHistoryDatabase.insertManualPoint(
-                            geoPoint.latitude,
-                            geoPoint.longitude
-                        )
-                        runOnUiThread { refreshSavedPoints() }
-                    }
-                    return true
+            if (editMode == EditMode.Normal) return false
+
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.x
+                    downY = e.y
+                    moved = false
+                    return false
                 }
-                EditMode.Deletion -> {
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (kotlin.math.abs(e.x - downX) > touchSlop ||
+                        kotlin.math.abs(e.y - downY) > touchSlop
+                    ) {
+                        moved = true
+                    }
+                    return false
+                }
+
+                MotionEvent.ACTION_CANCEL -> {
+                    moved = false
+                    return false
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    if (moved) return false
+
                     val geoPoint =
                         mapView.projection.fromPixels(e.x.toInt(), e.y.toInt()) as GeoPoint
-                    databaseExecutor.execute {
-                        locationHistoryDatabase.deleteNearPoint(
-                            geoPoint.latitude,
-                            geoPoint.longitude
-                        )
-                        runOnUiThread { refreshSavedPoints() }
+
+                    when (editMode) {
+                        EditMode.Normal -> return false
+                        EditMode.Insertion -> {
+                            runEditActionAndRefresh {
+                                locationHistoryDatabase.insertManualPoint(
+                                    geoPoint.latitude,
+                                    geoPoint.longitude
+                                )
+                            }
+                            return true
+                        }
+
+                        EditMode.Deletion -> {
+                            runEditActionAndRefresh {
+                                locationHistoryDatabase.deleteNearPoint(
+                                    geoPoint.latitude,
+                                    geoPoint.longitude
+                                )
+                            }
+                            return true
+                        }
+
+                        EditMode.BulkInsertion -> {
+                            runEditActionAndRefresh {
+                                locationHistoryDatabase.insertManualPointBulk(
+                                    geoPoint.latitude,
+                                    geoPoint.longitude
+                                )
+                            }
+                            return true
+                        }
+
+                        EditMode.BulkDeletion -> {
+                            runEditActionAndRefresh {
+                                locationHistoryDatabase.deleteNearPointBulk(
+                                    geoPoint.latitude,
+                                    geoPoint.longitude
+                                )
+                            }
+                            return true
+                        }
                     }
-                    return true
                 }
             }
 
+            return false
         }
 
     }

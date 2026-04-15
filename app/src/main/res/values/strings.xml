@@ -11,4 +11,6 @@
     <string name="edit_mode_normal">Normal</string>
     <string name="edit_mode_insert">Insert</string>
     <string name="edit_mode_delete">Delete</string>
+    <string name="edit_mode_bulk_insert">Bulk Add</string>
+    <string name="edit_mode_bulk_delete">Bulk Delete</string>
 </resources>
