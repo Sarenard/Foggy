@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Foggy Visual</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIINfQbM7kIYoBo4JU+E6X5nUVx5dQeG1uU=" crossorigin="">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="toolbar" aria-label="Contrôles">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1>Foggy Visual</h1>
+          <dl id="cityStats" class="city-stats is-hidden" aria-label="Statistiques de la ville sélectionnée">
+            <dt id="cityStatsTitle">Ville</dt>
+            <dd>
+              <span>Visité <strong id="cityVisitedCells">0</strong></span>
+              <span>Total <strong id="cityTotalCells">...</strong></span>
+              <span>Pct <strong id="cityPercent">...</strong></span>
+              <span>GPS <strong id="cityNormalCells">0</strong></span>
+              <span>Ajout <strong id="cityAddedCells">0</strong></span>
+              <span>Suppr. <strong id="cityRemovedCells">0</strong></span>
+            </dd>
+          </dl>
+        </div>
+
+        <div class="controls">
+          <label class="file-control">
+            <span>DB</span>
+            <input id="dbFileInput" type="file" accept=".db,.sqlite,.sqlite3,application/x-sqlite3">
+          </label>
+
+          <label class="select-control" title="Fond de carte">
+            <span>Fond</span>
+            <select id="basemapSelect">
+              <option value="cartoVoyager">CARTO</option>
+              <option value="openStreetMap">OSM</option>
+              <option value="osmHot">OSM HOT</option>
+              <option value="none">Aucun</option>
+            </select>
+          </label>
+
+          <button id="loadDefaultButton" type="button" title="Charger ../location_history.db">
+            Charger local
+          </button>
+
+          <button id="fitButton" type="button" title="Recentrer sur les cellules">
+            Recentrer
+          </button>
+        </div>
+
+        <dl class="stats" aria-label="Statistiques">
+          <div>
+            <dt>Visité</dt>
+            <dd id="totalCells">0</dd>
+          </div>
+          <div>
+            <dt>GPS</dt>
+            <dd id="normalCells">0</dd>
+          </div>
+          <div>
+            <dt>Ajout</dt>
+            <dd id="addedCells">0</dd>
+          </div>
+          <div>
+            <dt>Suppr.</dt>
+            <dd id="removedCells">0</dd>
+          </div>
+        </dl>
+      </header>
+
+      <section class="map-stage" aria-label="Carte des cellules Foggy">
+        <div id="map"></div>
+        <div id="timelineControl" class="timeline-control is-hidden" aria-label="Timeline des cellules">
+          <button id="timelinePlayButton" class="timeline-play-button" type="button" aria-label="Lire la timeline">▶</button>
+          <span id="timelineStartLabel" class="timeline-date">--</span>
+          <input id="timelineInput" type="range" min="0" max="0" step="1" value="0" aria-label="Date affichée">
+          <span id="timelineEndLabel" class="timeline-date">--</span>
+          <output id="timelineCurrentLabel" class="timeline-current">--</output>
+        </div>
+        <div id="statusBar" role="status">Prêt à charger une base v4.</div>
+      </section>
+    </main>
+
+    <div id="saveSummaryDialog" class="modal-backdrop is-hidden" role="dialog" aria-modal="true" aria-labelledby="saveSummaryTitle">
+      <section class="modal-panel">
+        <header class="modal-header">
+          <h2 id="saveSummaryTitle">Sauver DB</h2>
+          <button id="saveSummaryCloseButton" class="icon-button" type="button" aria-label="Fermer">×</button>
+        </header>
+        <dl class="summary-grid" aria-label="Récapitulatif des changements">
+          <div>
+            <dt>Ajoutées</dt>
+            <dd id="summaryAddedCells">0</dd>
+          </div>
+          <div>
+            <dt>Supprimées</dt>
+            <dd id="summaryDeletedCells">0</dd>
+          </div>
+          <div>
+            <dt>État changé</dt>
+            <dd id="summaryStateChangedCells">0</dd>
+          </div>
+          <div>
+            <dt>Date changée</dt>
+            <dd id="summaryRecordedAtChangedCells">0</dd>
+          </div>
+        </dl>
+        <p id="summaryText" class="summary-text">Aucun changement détecté.</p>
+        <footer class="modal-actions">
+          <button id="saveSummaryCancelButton" type="button">Annuler</button>
+          <button id="saveSummaryConfirmButton" class="primary-action" type="button">Exporter DB</button>
+        </footer>
+      </section>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
