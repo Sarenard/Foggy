@@ -19,3 +19,4 @@ logs/*
 *.db-wal
 *.db-shm
 *.log
+*/__pycache__

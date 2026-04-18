@@ -1,3 +1,5 @@
+# Todo : le rendu initial doit se faire en local
+
 # TODO : optimise
 things proposed by codex : (ask before implementing each one)
 

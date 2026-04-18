@@ -3,8 +3,6 @@ import json
 import math
 import os
 import queue
-import sqlite3
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -25,9 +23,9 @@ EDIT_STATE_NORMAL = 0
 EDIT_STATE_ADDED_BY_EDIT = 1
 EDIT_STATE_REMOVED_BY_EDIT = 2
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
-NOMINATIM_MIN_REQUEST_INTERVAL_SECONDS = 5
+NOMINATIM_MIN_REQUEST_INTERVAL_SECONDS = 1.2
 NOMINATIM_TIMEOUT_SECONDS = 8
-LEADERBOARD_REFRESH_INTERVAL_SECONDS = float(os.environ.get("FOGGY_VISUAL_LEADERBOARD_REFRESH_SECONDS", "5"))
+LEADERBOARD_REFRESH_INTERVAL_SECONDS = float(os.environ.get("FOGGY_VISUAL_LEADERBOARD_REFRESH_SECONDS", "1.2"))
 BOUNDARY_CACHE_PATH = Path(os.environ.get(
     "FOGGY_VISUAL_BOUNDARY_CACHE",
     str(SERVER_DIR / "city_boundary_cache.json"),
@@ -41,6 +39,8 @@ last_nominatim_request_at = 0.0
 jobs = {}
 jobs_lock = threading.Lock()
 boundary_cache_lock = threading.Lock()
+uploaded_db = None
+uploaded_db_lock = threading.Lock()
 
 
 class FoggyVisualHandler(BaseHTTPRequestHandler):
@@ -64,24 +64,43 @@ class FoggyVisualHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        if self.path != "/api/parse-db":
-            self.send_json({"error": "Endpoint inconnu"}, HTTPStatus.NOT_FOUND)
+        if self.path == "/api/upload-db":
+            try:
+                db_bytes = self.read_request_body("DB")
+                store_uploaded_db(db_bytes)
+                self.send_json({"ok": True, "bytes": len(db_bytes)})
+            except ClientError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except Exception as error:
+                self.log_error("Erreur réception DB: %s", error)
+                self.send_json({"error": "Impossible de récupérer la DB"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
-        try:
-            db_bytes = self.read_request_body()
-            parsed = parse_db_bytes(db_bytes)
-            self.send_json(parsed)
-        except ClientError as error:
-            self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-        except Exception as error:
-            self.log_error("Erreur parse DB: %s", error)
-            self.send_json({"error": "Impossible de parser la DB"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        if self.path == "/api/start-leaderboard":
+            try:
+                payload = self.read_json_request_body()
+                cells = validate_cells_payload(payload.get("cells") if isinstance(payload, dict) else None)
+                leaderboard = build_initial_leaderboard(cells)
+                job = LeaderboardJob(cells, leaderboard)
+                register_job(job)
+                job.start()
+                self.send_json({
+                    "leaderboard": leaderboard,
+                    "leaderboardJobId": job.job_id,
+                })
+            except ClientError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except Exception as error:
+                self.log_error("Erreur leaderboard: %s", error)
+                self.send_json({"error": "Impossible de lancer le leaderboard"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
 
-    def read_request_body(self):
+        self.send_json({"error": "Endpoint inconnu"}, HTTPStatus.NOT_FOUND)
+
+    def read_request_body(self, label="Corps de requête"):
         length_header = self.headers.get("Content-Length")
         if not length_header:
-            raise ClientError("Corps de requête vide")
+            raise ClientError(f"{label} vide")
 
         try:
             content_length = int(length_header)
@@ -89,15 +108,22 @@ class FoggyVisualHandler(BaseHTTPRequestHandler):
             raise ClientError("Content-Length invalide") from error
 
         if content_length <= 0:
-            raise ClientError("DB vide")
+            raise ClientError(f"{label} vide")
         if content_length > MAX_DB_BYTES:
-            raise ClientError(f"DB trop grosse ({content_length} octets, max {MAX_DB_BYTES})")
+            raise ClientError(f"{label} trop gros ({content_length} octets, max {MAX_DB_BYTES})")
 
-        db_bytes = self.rfile.read(content_length)
-        if len(db_bytes) != content_length:
-            raise ClientError("DB reçue incomplète")
+        body = self.rfile.read(content_length)
+        if len(body) != content_length:
+            raise ClientError(f"{label} reçu incomplet")
 
-        return db_bytes
+        return body
+
+    def read_json_request_body(self):
+        body = self.read_request_body("JSON")
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ClientError("JSON invalide") from error
 
     def send_json(self, payload, status=HTTPStatus.OK):
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -160,61 +186,37 @@ class ClientError(Exception):
     pass
 
 
-def parse_db_bytes(db_bytes):
-    with tempfile.NamedTemporaryFile(prefix="foggy-visual-", suffix=".db") as temp_db:
-        temp_db.write(db_bytes)
-        temp_db.flush()
-
-        connection = sqlite3.connect(f"file:{temp_db.name}?mode=ro", uri=True)
-        try:
-            assert_v4_schema(connection)
-            cells = read_cells(connection)
-        finally:
-            connection.close()
-
-    leaderboard = build_leaderboard(cells)
-    job = LeaderboardJob(cells, leaderboard)
-    register_job(job)
-    job.start()
-
-    return {
-        "schemaVersion": 4,
-        "cells": cells,
-        "leaderboard": leaderboard,
-        "leaderboardJobId": job.job_id,
-    }
-
-
-def assert_v4_schema(connection):
-    required_columns = {"grid_column", "grid_row", "recorded_at", "edit_state"}
-    rows = connection.execute("PRAGMA table_info(gps_points)").fetchall()
-    if not rows:
-        raise ClientError("table gps_points absente")
-
-    columns = {row[1] for row in rows}
-    missing_columns = sorted(required_columns - columns)
-    if missing_columns:
-        raise ClientError(f"colonnes absentes: {', '.join(missing_columns)}")
-
-
-def read_cells(connection):
-    rows = connection.execute(
-        """
-        SELECT grid_column, grid_row, recorded_at, edit_state
-        FROM gps_points
-        ORDER BY recorded_at ASC
-        """
-    )
-
-    return [
-        {
-            "column": int(column),
-            "row": int(row),
-            "recordedAt": int(recorded_at),
-            "editState": int(edit_state),
+def store_uploaded_db(db_bytes):
+    global uploaded_db
+    with uploaded_db_lock:
+        uploaded_db = {
+            "bytes": bytes(db_bytes),
+            "receivedAt": int(time.time() * 1000),
         }
-        for column, row, recorded_at, edit_state in rows
-    ]
+
+
+def validate_cells_payload(raw_cells):
+    if not isinstance(raw_cells, list):
+        raise ClientError("cellules absentes")
+
+    cells = []
+    for index, raw_cell in enumerate(raw_cells):
+        if not isinstance(raw_cell, dict):
+            raise ClientError(f"cellule #{index + 1} invalide")
+
+        try:
+            cell = {
+                "column": int(raw_cell["column"]),
+                "row": int(raw_cell["row"]),
+                "recordedAt": int(raw_cell["recordedAt"]),
+                "editState": int(raw_cell["editState"]),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise ClientError(f"cellule #{index + 1} invalide") from error
+
+        cells.append(cell)
+
+    return cells
 
 
 def build_leaderboard_payload(cells):
@@ -228,11 +230,30 @@ def build_leaderboard_payload(cells):
     }
 
 
+def build_initial_leaderboard(cells):
+    summary = build_leaderboard_payload(cells)
+    return {
+        **summary,
+        "cities": [],
+        "unresolvedCells": summary["activeCells"],
+        "fetchedBoundaries": 0,
+        "fetchAttempts": 0,
+        "boundaryCacheItems": 0,
+        "boundaryCacheMisses": 0,
+        "doneCities": 0,
+        "remainingCities": 0,
+        "refreshIntervalSeconds": LEADERBOARD_REFRESH_INTERVAL_SECONDS,
+        "complete": False,
+        "pending": True,
+    }
+
+
 class LeaderboardJob:
     def __init__(self, cells, initial_leaderboard):
         self.job_id = uuid.uuid4().hex
         self.cells = cells
         self.leaderboard = initial_leaderboard
+        self.state = None
         self.subscribers = []
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.run, name=f"foggy-lb-{self.job_id[:8]}", daemon=True)
@@ -275,9 +296,25 @@ class LeaderboardJob:
 
     def run(self):
         try:
+            self.last_status = "Initialisation leaderboard depuis le cache..."
+            self.update_progress_only()
+            self.publish("leaderboard", self.current_payload())
+            self.state = LeaderboardState(self.cells)
+            self.set_leaderboard(self.state.payload(
+                fetched_boundaries=self.fetched_boundaries,
+                fetch_attempts=self.fetch_attempts,
+            ))
+            self.last_status = "Cache leaderboard chargé."
+            self.publish("leaderboard", self.current_payload())
+
+            first_pass = True
             while True:
-                time.sleep(LEADERBOARD_REFRESH_INTERVAL_SECONDS)
-                candidate = find_next_uncached_cell(self.cells, self.attempted_cell_keys)
+                if first_pass:
+                    first_pass = False
+                else:
+                    time.sleep(LEADERBOARD_REFRESH_INTERVAL_SECONDS)
+
+                candidate = self.state.find_next_uncached_cell(self.attempted_cell_keys)
 
                 if not candidate:
                     self.finish()
@@ -292,17 +329,22 @@ class LeaderboardJob:
 
                 boundary = fetch_city_boundary(cell_to_center_latlng(candidate))
                 if boundary and is_allowed_city_boundary(boundary):
-                    upsert_boundary_cache(boundary)
+                    boundary = upsert_boundary_cache(boundary)
                     self.fetched_boundaries += 1
+                    self.state.apply_boundary(boundary)
                     self.last_status = f"Frontière récupérée : {boundary.get('name') or 'Ville'}."
                 elif boundary:
-                    mark_boundary_cache_miss(candidate, f"frontière ignorée: {boundary.get('name') or 'sans nom'}")
+                    miss_reason = f"frontière ignorée: {boundary.get('name') or 'sans nom'}"
+                    mark_boundary_cache_miss(candidate, miss_reason)
+                    self.state.mark_cell_miss(candidate, miss_reason)
                     self.last_status = f"Frontière ignorée : {boundary.get('name') or 'sans nom'}."
                 else:
-                    mark_boundary_cache_miss(candidate, "aucune frontière exploitable")
+                    miss_reason = "aucune frontière exploitable"
+                    mark_boundary_cache_miss(candidate, miss_reason)
+                    self.state.mark_cell_miss(candidate, miss_reason)
                     self.last_status = "Aucune frontière exploitable trouvée pour cette cellule."
 
-                leaderboard = self.update_leaderboard()
+                leaderboard = self.update_leaderboard_from_state()
                 self.publish("leaderboard", self.current_payload())
 
                 if leaderboard["complete"]:
@@ -321,19 +363,20 @@ class LeaderboardJob:
                 "fetchAttempts": self.fetch_attempts,
             }
 
-    def update_leaderboard(self):
-        leaderboard = build_leaderboard(
-            self.cells,
+    def update_leaderboard_from_state(self):
+        leaderboard = self.state.payload(
             fetched_boundaries=self.fetched_boundaries,
             fetch_attempts=self.fetch_attempts,
-            refresh_interval_seconds=LEADERBOARD_REFRESH_INTERVAL_SECONDS,
         )
-        with self.lock:
-            self.leaderboard = leaderboard
+        self.set_leaderboard(leaderboard)
         return leaderboard
 
+    def set_leaderboard(self, leaderboard):
+        with self.lock:
+            self.leaderboard = leaderboard
+
     def finish(self):
-        leaderboard = self.update_leaderboard()
+        leaderboard = self.update_leaderboard_from_state()
         with self.lock:
             self.done = True
 
@@ -350,28 +393,139 @@ def get_job(job_id):
         return jobs.get(job_id)
 
 
-def find_next_uncached_cell(cells, attempted_cell_keys):
-    cache = load_boundary_cache()
+class LeaderboardState:
+    def __init__(self, cells):
+        self.summary = build_leaderboard_payload(cells)
+        self.city_counts = {}
+        self.unresolved_cells = []
+        self.unresolved_cell_keys = set()
+        self.cache = load_boundary_cache()
+        self.cache_changed = False
+        self.initialize_from_cache(cells)
+        if self.cache_changed:
+            save_boundary_cache(self.cache)
 
-    for cell in representative_active_cells(cells):
-        if cell["editState"] == EDIT_STATE_REMOVED_BY_EDIT:
-            continue
+    def initialize_from_cache(self, cells):
+        boundaries = list(self.cache["items"].values())
 
+        for cell in cells:
+            if cell["editState"] == EDIT_STATE_REMOVED_BY_EDIT:
+                continue
+
+            boundary = find_boundary_containing_cell(cell, boundaries)
+
+            if boundary and is_allowed_city_boundary(boundary):
+                self.add_cell_to_boundary(cell, boundary)
+            else:
+                self.add_unresolved_cell(cell)
+
+    def add_cell_to_boundary(self, cell, boundary):
+        key = boundary["key"]
+        city = self.city_counts.get(key)
+
+        if not city:
+            total_grid_cells = boundary.get("totalGridCells") or count_grid_cells_in_rows(boundary.get("gridRows"))
+
+            city = {
+                "key": key,
+                "name": boundary.get("name") or "Ville",
+                "boundaryType": boundary.get("boundaryType") or "",
+                "countryCode": boundary.get("countryCode") or "",
+                "normal": 0,
+                "added": 0,
+                "removed": 0,
+                "visited": 0,
+                "total": total_grid_cells,
+                "percent": 0.0,
+            }
+            self.city_counts[key] = city
+
+        if cell["editState"] == EDIT_STATE_ADDED_BY_EDIT:
+            city["added"] += 1
+        else:
+            city["normal"] += 1
+
+        city["visited"] = city["normal"] + city["added"]
+        city["percent"] = (100.0 * city["visited"] / city["total"]) if city["total"] > 0 else 0.0
+
+    def add_unresolved_cell(self, cell):
         key = cell_cache_key(cell)
-        if key in attempted_cell_keys:
-            continue
+        if key in self.unresolved_cell_keys:
+            return
 
+        self.unresolved_cell_keys.add(key)
+        self.unresolved_cells.append(cell)
+
+    def mark_cell_miss(self, cell, reason):
+        self.add_unresolved_cell(cell)
         latlng = cell_to_center_latlng(cell)
-        if find_boundary_containing_latlng(latlng, cache["items"].values()):
-            continue
+        self.cache["misses"][cell_cache_key(cell)] = {
+            "column": cell["column"],
+            "row": cell["row"],
+            "lat": latlng["lat"],
+            "lng": latlng["lng"],
+            "reason": reason,
+            "attemptedAt": int(time.time() * 1000),
+        }
 
-        if key in cache["misses"]:
-            continue
+    def apply_boundary(self, boundary):
+        key = boundary["key"]
+        self.cache["items"][key] = boundary
+        next_unresolved_cells = []
+        next_unresolved_keys = set()
 
-        return cell
+        for cell in self.unresolved_cells:
+            if is_cell_inside_boundary(cell, boundary):
+                self.add_cell_to_boundary(cell, boundary)
+            else:
+                next_unresolved_cells.append(cell)
+                next_unresolved_keys.add(cell_cache_key(cell))
 
-    return None
+        self.unresolved_cells = next_unresolved_cells
+        self.unresolved_cell_keys = next_unresolved_keys
 
+    def find_next_uncached_cell(self, attempted_cell_keys):
+        misses = self.cache["misses"]
+
+        for cell in self.candidate_cells():
+            key = cell_cache_key(cell)
+            if key in attempted_cell_keys:
+                continue
+            if key in misses:
+                continue
+            return cell
+
+        return None
+
+    def candidate_cells(self):
+        yield from representative_active_cells(self.unresolved_cells)
+
+    def remaining_city_candidates_count(self):
+        misses = self.cache["misses"]
+        candidates = 0
+
+        for cell in self.candidate_cells():
+            if cell_cache_key(cell) in misses:
+                continue
+            candidates += 1
+
+        return candidates
+
+    def payload(self, fetched_boundaries=0, fetch_attempts=0):
+        cities = sorted(self.city_counts.values(), key=lambda city: normalized_boundary_name(city["name"]))
+        return {
+            **self.summary,
+            "cities": cities,
+            "unresolvedCells": len(self.unresolved_cells),
+            "fetchedBoundaries": fetched_boundaries,
+            "fetchAttempts": fetch_attempts,
+            "boundaryCacheItems": len(self.cache["items"]),
+            "boundaryCacheMisses": len(self.cache["misses"]),
+            "doneCities": len(cities),
+            "remainingCities": self.remaining_city_candidates_count(),
+            "refreshIntervalSeconds": LEADERBOARD_REFRESH_INTERVAL_SECONDS,
+            "complete": len(self.unresolved_cells) == 0,
+        }
 
 def representative_active_cells(cells):
     seen_buckets = set()
@@ -396,78 +550,6 @@ def representative_active_cells(cells):
 def cell_cache_key(cell):
     return f"{cell['column']}:{cell['row']}"
 
-
-def build_leaderboard(
-    cells,
-    fetched_boundaries=0,
-    fetch_attempts=0,
-    refresh_interval_seconds=LEADERBOARD_REFRESH_INTERVAL_SECONDS,
-):
-    summary = build_leaderboard_payload(cells)
-    cache = load_boundary_cache()
-    active_cells = [cell for cell in cells if cell["editState"] != EDIT_STATE_REMOVED_BY_EDIT]
-    city_counts = {}
-    unresolved_cells = 0
-    cache_changed = False
-
-    for cell in active_cells:
-        latlng = cell_to_center_latlng(cell)
-        boundary = find_boundary_containing_latlng(latlng, cache["items"].values())
-
-        if not boundary or not is_allowed_city_boundary(boundary):
-            unresolved_cells += 1
-            continue
-
-        key = boundary["key"]
-        if key not in city_counts:
-            total_grid_cells = boundary.get("totalGridCells")
-            if not isinstance(total_grid_cells, int):
-                total_grid_cells = count_grid_cells_inside_geojson(boundary.get("geoJson"))
-                boundary["totalGridCells"] = total_grid_cells
-                cache["items"][key] = boundary
-                cache_changed = True
-
-            city_counts[key] = {
-                "key": key,
-                "name": boundary.get("name") or "Ville",
-                "boundaryType": boundary.get("boundaryType") or "",
-                "countryCode": boundary.get("countryCode") or "",
-                "normal": 0,
-                "added": 0,
-                "removed": 0,
-                "visited": 0,
-                "total": total_grid_cells,
-                "percent": 0.0,
-            }
-
-        city = city_counts[key]
-        if cell["editState"] == EDIT_STATE_ADDED_BY_EDIT:
-            city["added"] += 1
-        else:
-            city["normal"] += 1
-        city["visited"] = city["normal"] + city["added"]
-
-    for city in city_counts.values():
-        city["percent"] = (100.0 * city["visited"] / city["total"]) if city["total"] > 0 else 0.0
-
-    if cache_changed:
-        save_boundary_cache(cache)
-
-    cities = sorted(city_counts.values(), key=lambda city: normalized_boundary_name(city["name"]))
-
-    return {
-        **summary,
-        "cities": cities,
-        "unresolvedCells": unresolved_cells,
-        "fetchedBoundaries": fetched_boundaries,
-        "fetchAttempts": fetch_attempts,
-        "boundaryCacheItems": len(cache["items"]),
-        "boundaryCacheMisses": len(cache["misses"]),
-        "refreshIntervalSeconds": refresh_interval_seconds,
-        "complete": unresolved_cells == 0,
-    }
-
-
 def empty_boundary_cache():
     return {
         "version": BOUNDARY_CACHE_VERSION,
@@ -489,10 +571,10 @@ def load_boundary_cache():
     if not isinstance(payload, dict):
         return empty_boundary_cache()
 
-    if not isinstance(payload.get("items"), dict):
-        payload["items"] = {}
-    if not isinstance(payload.get("misses"), dict):
-        payload["misses"] = {}
+    items = payload.get("items")
+    misses = payload.get("misses")
+    payload["items"] = items if isinstance(items, dict) else {}
+    payload["misses"] = misses if isinstance(misses, dict) else {}
     payload["version"] = BOUNDARY_CACHE_VERSION
 
     return payload
@@ -514,13 +596,12 @@ def save_boundary_cache(cache):
 
 
 def upsert_boundary_cache(boundary):
-    if not isinstance(boundary.get("totalGridCells"), int):
-        boundary["totalGridCells"] = count_grid_cells_inside_geojson(boundary.get("geoJson"))
-
+    boundary = cache_boundary_from_boundary(boundary)
     boundary["cachedAt"] = int(time.time() * 1000)
     cache = load_boundary_cache()
     cache["items"][boundary["key"]] = boundary
     save_boundary_cache(cache)
+    return boundary
 
 
 def mark_boundary_cache_miss(cell, reason):
@@ -535,6 +616,109 @@ def mark_boundary_cache_miss(cell, reason):
         "attemptedAt": int(time.time() * 1000),
     }
     save_boundary_cache(cache)
+
+
+def cache_boundary_from_boundary(boundary):
+    grid_rows = grid_rows_inside_geojson(boundary.get("geoJson"))
+    return {
+        "key": boundary["key"],
+        "name": boundary.get("name") or "Ville",
+        "boundaryType": boundary.get("boundaryType") or "",
+        "countryCode": boundary.get("countryCode") or "",
+        "hasLocalBoundaryName": boundary.get("hasLocalBoundaryName") is not False,
+        "gridRows": grid_rows,
+        "totalGridCells": count_grid_cells_in_rows(grid_rows),
+        "lastUsedAt": int(time.time() * 1000),
+    }
+
+
+def grid_rows_inside_geojson(geo_json):
+    projected_polygons = project_geojson_to_mercator_polygons(geo_json)
+    bounds = compute_projected_bounds(projected_polygons)
+    if not bounds:
+        return {}
+
+    min_column = int(bounds["minX"] // GRID_CELL_SIZE_METERS)
+    max_column = int(-(-bounds["maxX"] // GRID_CELL_SIZE_METERS))
+    min_row = int(bounds["minY"] // GRID_CELL_SIZE_METERS)
+    max_row = int(-(-bounds["maxY"] // GRID_CELL_SIZE_METERS))
+    grid_rows = {}
+
+    for row in range(min_row, max_row + 1):
+        center_y = (row + 0.5) * GRID_CELL_SIZE_METERS
+        intervals = []
+        interval_start = None
+        previous_column = None
+
+        for column in range(min_column, max_column + 1):
+            center_x = (column + 0.5) * GRID_CELL_SIZE_METERS
+            inside = is_projected_point_inside_polygons(
+                {"x": center_x, "y": center_y},
+                projected_polygons,
+            )
+
+            if inside and interval_start is None:
+                interval_start = column
+                previous_column = column
+            elif inside:
+                previous_column = column
+            elif interval_start is not None:
+                intervals.append([interval_start, previous_column])
+                interval_start = None
+                previous_column = None
+
+        if interval_start is not None:
+            intervals.append([interval_start, previous_column])
+
+        if intervals:
+            grid_rows[str(row)] = intervals
+
+    return grid_rows
+
+
+def count_grid_cells_in_rows(grid_rows):
+    if not isinstance(grid_rows, dict):
+        return 0
+
+    total = 0
+    for intervals in grid_rows.values():
+        if not isinstance(intervals, list):
+            continue
+
+        for interval in intervals:
+            if not isinstance(interval, list) or len(interval) != 2:
+                continue
+            total += int(interval[1]) - int(interval[0]) + 1
+
+    return total
+
+
+def find_boundary_containing_cell(cell, boundaries):
+    for boundary in boundaries:
+        if boundary and is_allowed_city_boundary(boundary) and is_cell_inside_boundary(cell, boundary):
+            boundary["lastUsedAt"] = int(time.time() * 1000)
+            return boundary
+
+    return None
+
+
+def is_cell_inside_boundary(cell, boundary):
+    grid_rows = boundary.get("gridRows") if isinstance(boundary, dict) else None
+    if not isinstance(grid_rows, dict):
+        return False
+
+    intervals = grid_rows.get(str(cell["row"]))
+    if not isinstance(intervals, list):
+        return False
+
+    column = cell["column"]
+    for start, end in intervals:
+        if column < start:
+            return False
+        if start <= column <= end:
+            return True
+
+    return False
 
 
 def fetch_city_boundary(latlng):
@@ -634,19 +818,6 @@ def is_nominatim_country_boundary(data, address):
     )
 
 
-def find_boundary_containing_latlng(latlng, boundaries):
-    for boundary in boundaries:
-        if (
-            boundary
-            and is_allowed_city_boundary(boundary)
-            and is_latlng_inside_geojson(latlng, boundary.get("geoJson"))
-        ):
-            boundary["lastUsedAt"] = int(time.time() * 1000)
-            return boundary
-
-    return None
-
-
 def is_allowed_city_boundary(boundary):
     if not boundary:
         return False
@@ -658,83 +829,6 @@ def is_allowed_city_boundary(boundary):
     if name in ("france", "republique francaise"):
         return False
     return True
-
-
-def is_latlng_inside_geojson(latlng, geo_json):
-    if not isinstance(geo_json, dict):
-        return False
-
-    if geo_json.get("type") == "Polygon":
-        return is_latlng_inside_polygon_coordinates(latlng, geo_json.get("coordinates"))
-
-    if geo_json.get("type") == "MultiPolygon":
-        return any(
-            is_latlng_inside_polygon_coordinates(latlng, polygon)
-            for polygon in geo_json.get("coordinates") or []
-        )
-
-    return False
-
-
-def is_latlng_inside_polygon_coordinates(latlng, polygon_coordinates):
-    if not polygon_coordinates:
-        return False
-
-    outer_ring = polygon_coordinates[0]
-    if not is_latlng_inside_ring(latlng, outer_ring):
-        return False
-
-    return all(not is_latlng_inside_ring(latlng, hole) for hole in polygon_coordinates[1:])
-
-
-def is_latlng_inside_ring(latlng, ring):
-    if not isinstance(ring, list) or len(ring) < 3:
-        return False
-
-    inside = False
-    x = latlng["lng"]
-    y = latlng["lat"]
-    previous_index = len(ring) - 1
-
-    for current_index, current in enumerate(ring):
-        previous = ring[previous_index]
-        current_x = float(current[0])
-        current_y = float(current[1])
-        previous_x = float(previous[0])
-        previous_y = float(previous[1])
-        crosses = (
-            (current_y > y) != (previous_y > y)
-            and x < ((previous_x - current_x) * (y - current_y)) / ((previous_y - current_y) or 1e-9) + current_x
-        )
-
-        if crosses:
-            inside = not inside
-
-        previous_index = current_index
-
-    return inside
-
-
-def count_grid_cells_inside_geojson(geo_json):
-    projected_polygons = project_geojson_to_mercator_polygons(geo_json)
-    bounds = compute_projected_bounds(projected_polygons)
-    if not bounds:
-        return 0
-
-    min_column = int(bounds["minX"] // GRID_CELL_SIZE_METERS)
-    max_column = int(-(-bounds["maxX"] // GRID_CELL_SIZE_METERS))
-    min_row = int(bounds["minY"] // GRID_CELL_SIZE_METERS)
-    max_row = int(-(-bounds["maxY"] // GRID_CELL_SIZE_METERS))
-    total = 0
-
-    for column in range(min_column, max_column + 1):
-        center_x = (column + 0.5) * GRID_CELL_SIZE_METERS
-        for row in range(min_row, max_row + 1):
-            center_y = (row + 0.5) * GRID_CELL_SIZE_METERS
-            if is_projected_point_inside_polygons({"x": center_x, "y": center_y}, projected_polygons):
-                total += 1
-
-    return total
 
 
 def project_geojson_to_mercator_polygons(geo_json):
@@ -858,7 +952,7 @@ def main():
     port = int(os.environ.get("FOGGY_VISUAL_PORT", str(DEFAULT_PORT)))
     server = ThreadingHTTPServer(("127.0.0.1", port), FoggyVisualHandler)
     print(f"Foggy Visual API: http://127.0.0.1:{port}/")
-    print("Endpoints: GET /health, POST /api/parse-db")
+    print("Endpoints: GET /health, POST /api/upload-db, POST /api/start-leaderboard")
     server.serve_forever()
 
 

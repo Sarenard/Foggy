@@ -7,6 +7,7 @@ Le schéma de la DB est présent ici :
 - dans set_db.sh sur le test de cohérence
 - dans app.js, dans "pret a charger une app v4"
 - dans app.js, dans le parsing de la db
+- dans server.py, dans le parsing de la db
 Pense à le modif partout si tu le changfes
 De plus, si jamais un autre fichier se met a contenir un lien avec le schéma de DB, demande moi de modifier AGENTS.md pour le rajouter à la liste (ne le fait pas tout seul !)
 

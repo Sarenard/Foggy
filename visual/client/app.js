@@ -1,15 +1,17 @@
 const GRID_CELL_SIZE_METERS = 15.0;
 const WEB_MERCATOR_HALF_WORLD_METERS = 20037508.342789244;
 const WEB_MERCATOR_EARTH_RADIUS = 6378137.0;
-const DEFAULT_DB_URL = "../location_history.db";
+const DEFAULT_DB_URL = "../../location_history.db";
+const SERVER_API_BASE_URL = window.FOGGY_VISUAL_API_URL || "http://127.0.0.1:4173";
+const SERVER_API_ROOT = SERVER_API_BASE_URL.replace(/\/$/, "");
+const SERVER_UPLOAD_DB_URL = `${SERVER_API_ROOT}/api/upload-db`;
+const SERVER_START_LEADERBOARD_URL = `${SERVER_API_ROOT}/api/start-leaderboard`;
+const SERVER_LEADERBOARD_STREAM_URL = `${SERVER_API_ROOT}/api/leaderboard-stream`;
 const CITY_WORKER_URL = "cityWorker.js";
-const LEADERBOARD_TOTAL_WORKER_URL = "leaderboardTotalWorker.js";
 const NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse";
 const CITY_BOUNDARY_CACHE_KEY = "foggy.visual.cityBoundaryCache.v1";
 const CITY_BOUNDARY_CACHE_LIMIT = 1000;
 const CITY_BOUNDARY_MIN_REQUEST_INTERVAL_MS = 1200;
-const LEADERBOARD_FETCH_TIMEOUT_MS = 8000;
-const LEADERBOARD_REQUEST_SLOT_TIMEOUT_MS = 10000;
 
 const EDIT_STATE_NORMAL = 0;
 const EDIT_STATE_ADDED_BY_EDIT = 1;
@@ -59,7 +61,9 @@ const basemaps = {
 };
 
 let SQL;
+let sqlReadyPromise = null;
 let currentDb = null;
+let currentDbBytes = null;
 let currentDbLabel = "location_history.db";
 let dbDirty = false;
 let loadedCellsByKey = new Map();
@@ -88,15 +92,9 @@ let cityWorkerNextRequestId = 1;
 let cityWorkerTasks = new Map();
 let cityBoundaryLookupId = 0;
 let cityStatsRequestId = 0;
-let leaderboardPresentCityKeys = new Set();
-let leaderboardScanId = 0;
-let leaderboardScanComplete = false;
-let leaderboardScanRunning = false;
-let leaderboardTotalQueue = [];
-let leaderboardTotalQueuedKeys = new Set();
-let leaderboardTotalInFlightKey = null;
-let leaderboardTotalNextRequestId = 1;
-let leaderboardTotalCalculatedKeys = new Set();
+let serverLeaderboard = null;
+let leaderboardLoading = false;
+let leaderboardEventSource = null;
 
 const map = L.map("map", {
   preferCanvas: true,
@@ -219,7 +217,7 @@ dbFileInput.addEventListener("change", async (event) => {
 
   setStatus(`Lecture de ${file.name}...`);
   const buffer = await file.arrayBuffer();
-  loadDatabase(new Uint8Array(buffer), file.name);
+  await loadDatabase(new Uint8Array(buffer), file.name);
 });
 
 basemapSelect.addEventListener("change", (event) => {
@@ -236,9 +234,9 @@ cleanThresholdInput.addEventListener("input", (event) => {
   clearCleanPreview("Seuil modifié, aperçu clean annulé.");
 });
 
-cleanButton.addEventListener("click", () => {
+cleanButton.addEventListener("click", async () => {
   try {
-    handleCleanButtonClick(Number(cleanThresholdInput.value));
+    await handleCleanButtonClick(Number(cleanThresholdInput.value));
   } catch (error) {
     console.error(error);
     setStatus(`Erreur pendant le clean : ${error.message}`);
@@ -249,8 +247,10 @@ leaderboardButton.addEventListener("click", () => {
   showLeaderboard();
 });
 
-saveDbButton.addEventListener("click", () => {
-  showSaveSummary();
+saveDbButton.addEventListener("click", async () => {
+  if (await ensureLocalDatabaseForEditing()) {
+    showSaveSummary();
+  }
 });
 
 leaderboardCloseButton.addEventListener("click", () => {
@@ -265,9 +265,11 @@ saveSummaryCancelButton.addEventListener("click", () => {
   hideSaveSummary();
 });
 
-saveSummaryConfirmButton.addEventListener("click", () => {
+saveSummaryConfirmButton.addEventListener("click", async () => {
   hideSaveSummary();
-  exportCurrentDatabase();
+  if (await ensureLocalDatabaseForEditing()) {
+    exportCurrentDatabase();
+  }
 });
 
 saveSummaryDialog.addEventListener("click", (event) => {
@@ -310,7 +312,7 @@ loadDefaultButton.addEventListener("click", async () => {
       throw new Error(`HTTP ${response.status}`);
     }
     const buffer = await response.arrayBuffer();
-    loadDatabase(new Uint8Array(buffer), DEFAULT_DB_URL);
+    await loadDatabase(new Uint8Array(buffer), DEFAULT_DB_URL);
   } catch (error) {
     setStatus(`Impossible de charger ${DEFAULT_DB_URL}. Lance le serveur depuis la racine du repo ou choisis un fichier .db.`);
     console.error(error);
@@ -321,10 +323,10 @@ fitButton.addEventListener("click", () => {
   centerOnFirstRecordedCell(currentCells);
 });
 
-map.on("click", (event) => {
+map.on("click", async (event) => {
   if (currentMode !== MODE_CURSOR) {
     try {
-      runEditModeAt(event.latlng);
+      await runEditModeAt(event.latlng);
     } catch (error) {
       console.error(error);
       setStatus(`Erreur pendant l'édition : ${error.message}`);
@@ -349,7 +351,7 @@ window.addEventListener("beforeunload", (event) => {
   event.returnValue = "";
 });
 
-initSql();
+setStatus("Prêt à charger une base v4.");
 
 function setBasemap(name) {
   if (currentBasemapLayer) {
@@ -1021,9 +1023,187 @@ async function initSql() {
     locateFile: (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}`
   });
   setStatus("Prêt à charger une base v4.");
+  return SQL;
 }
 
-function loadDatabase(bytes, label) {
+function ensureSqlReady() {
+  if (SQL) return Promise.resolve(SQL);
+  if (!sqlReadyPromise) {
+    sqlReadyPromise = initSql();
+  }
+  return sqlReadyPromise;
+}
+
+async function loadDatabase(bytes, label) {
+  await uploadDatabaseToServer(bytes, label);
+  await loadDatabaseLocally(bytes, label);
+}
+
+async function uploadDatabaseToServer(bytes, label) {
+  try {
+    setStatus(`Envoi de ${label} au serveur local...`);
+    const response = await fetch(SERVER_UPLOAD_DB_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-sqlite3"
+      },
+      body: bytes
+    });
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok || !payload || payload.error) {
+      throw new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`);
+    }
+
+    setStatus(`${label} reçu par le serveur local, parsing dans le navigateur...`);
+  } catch (error) {
+    console.error(error);
+    setStatus(`Serveur local indisponible, parsing local de ${label}...`);
+  }
+}
+
+async function startServerLeaderboard(cells) {
+  closeLeaderboardStream();
+  leaderboardLoading = true;
+  serverLeaderboard = buildPendingLeaderboard(cells);
+  if (!leaderboardDialog.classList.contains("is-hidden")) {
+    renderLeaderboard();
+  }
+
+  try {
+    const response = await fetch(SERVER_START_LEADERBOARD_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ cells })
+    });
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok || !payload || payload.error) {
+      throw new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`);
+    }
+
+    serverLeaderboard = payload.leaderboard || null;
+    leaderboardLoading = false;
+    connectLeaderboardStream(payload.leaderboardJobId);
+    if (!leaderboardDialog.classList.contains("is-hidden")) {
+      renderLeaderboard();
+    }
+  } catch (error) {
+    console.error(error);
+    leaderboardLoading = false;
+    serverLeaderboard = null;
+    setStatus("Leaderboard serveur indisponible, affichage des cellules local uniquement.");
+    if (!leaderboardDialog.classList.contains("is-hidden")) {
+      renderLeaderboard();
+    }
+  }
+}
+
+function buildPendingLeaderboard(cells) {
+  const counts = new Map([
+    [EDIT_STATE_NORMAL, 0],
+    [EDIT_STATE_ADDED_BY_EDIT, 0],
+    [EDIT_STATE_REMOVED_BY_EDIT, 0]
+  ]);
+
+  for (const cell of cells) {
+    counts.set(cell.editState, (counts.get(cell.editState) || 0) + 1);
+  }
+
+  const normal = counts.get(EDIT_STATE_NORMAL) || 0;
+  const added = counts.get(EDIT_STATE_ADDED_BY_EDIT) || 0;
+  const removed = counts.get(EDIT_STATE_REMOVED_BY_EDIT) || 0;
+  const activeCells = normal + added;
+
+  return {
+    activeCells,
+    totalCells: cells.length,
+    normalCells: normal,
+    addedCells: added,
+    removedCells: removed,
+    cities: [],
+    unresolvedCells: activeCells,
+    fetchedBoundaries: 0,
+    fetchAttempts: 0,
+    boundaryCacheItems: 0,
+    boundaryCacheMisses: 0,
+    doneCities: 0,
+    remainingCities: 0,
+    complete: false,
+    pending: true
+  };
+}
+
+function connectLeaderboardStream(jobId) {
+  closeLeaderboardStream();
+
+  if (!jobId || !("EventSource" in window)) {
+    return;
+  }
+
+  const url = new URL(SERVER_LEADERBOARD_STREAM_URL);
+  url.searchParams.set("jobId", jobId);
+  leaderboardEventSource = new EventSource(url.toString());
+
+  leaderboardEventSource.addEventListener("leaderboard", (event) => {
+    applyLeaderboardStreamPayload(event.data);
+  });
+  leaderboardEventSource.addEventListener("done", (event) => {
+    applyLeaderboardStreamPayload(event.data);
+    closeLeaderboardStream();
+  });
+  leaderboardEventSource.addEventListener("error", (event) => {
+    applyLeaderboardStreamPayload(event.data);
+  });
+  leaderboardEventSource.onerror = () => {
+    setStatus("Flux leaderboard interrompu.");
+    closeLeaderboardStream();
+  };
+}
+
+function applyLeaderboardStreamPayload(rawData) {
+  let payload;
+  try {
+    payload = JSON.parse(rawData);
+  } catch (error) {
+    console.error(error);
+    return;
+  }
+
+  if (!payload || !payload.leaderboard) return;
+
+  leaderboardLoading = false;
+  serverLeaderboard = payload.leaderboard;
+  if (!leaderboardDialog.classList.contains("is-hidden")) {
+    renderLeaderboard();
+  }
+
+  const unresolved = Number(serverLeaderboard.unresolvedCells || 0);
+  const fetched = Number(serverLeaderboard.fetchedBoundaries || 0);
+  const attempts = Number(serverLeaderboard.fetchAttempts || 0);
+  const cacheItems = Number(serverLeaderboard.boundaryCacheItems || 0);
+  const cacheMisses = Number(serverLeaderboard.boundaryCacheMisses || 0);
+  const details = payload.status ? ` ${payload.status}` : "";
+  setStatus(
+    serverLeaderboard.complete
+      ? "Leaderboard serveur complet."
+      : `Leaderboard serveur : ${formatNumber(fetched)} frontière(s), ${formatNumber(attempts)} tentative(s), cache ${formatNumber(cacheItems)}/${formatNumber(cacheMisses)}, ${formatNumber(unresolved)} cellule(s) sans ville.${details}`
+  );
+}
+
+function closeLeaderboardStream() {
+  if (!leaderboardEventSource) return;
+
+  leaderboardEventSource.close();
+  leaderboardEventSource = null;
+}
+
+async function loadDatabaseLocally(bytes, label) {
+  closeLeaderboardStream();
+  await ensureSqlReady();
+
   if (!SQL) {
     setStatus("SQLite n'est pas encore prêt, réessaie dans une seconde.");
     return;
@@ -1034,26 +1214,59 @@ function loadDatabase(bytes, label) {
     assertV4Schema(nextDb);
     const cells = readCells(nextDb);
 
-    if (currentDb) {
-      currentDb.close();
-    }
-
-    currentDb = nextDb;
-    currentDbLabel = label || "location_history.db";
-    dbDirty = false;
-    loadedCellsByKey = mapCellsByKey(cells);
-    resetLeaderboardPresence();
-    clearCachedCityStats();
-    clearCleanPreview();
-    resetTimeline(cells);
-
-    renderCells(cells);
-    updateStats(cells);
-    centerOnFirstRecordedCell(cells);
-    setStatus(`${formatNumber(cells.length)} cellules chargées depuis ${label}.`);
+    applyLoadedCells(cells, label, bytes, nextDb, null);
+    setStatus(`${formatNumber(cells.length)} cellules parsées dans le navigateur depuis ${label}.`);
+    startServerLeaderboard(cells);
   } catch (error) {
     setStatus(`Base illisible ou hors format v4 : ${error.message}`);
     console.error(error);
+  }
+}
+
+function applyLoadedCells(cells, label, bytes, nextDb, leaderboardPayload) {
+  if (!Array.isArray(cells)) {
+    throw new Error("réponse serveur sans cellules");
+  }
+
+  if (currentDb && currentDb !== nextDb) {
+    currentDb.close();
+  }
+
+  currentDb = nextDb;
+  currentDbBytes = bytes ? new Uint8Array(bytes) : null;
+  currentDbLabel = label || "location_history.db";
+  dbDirty = false;
+  loadedCellsByKey = mapCellsByKey(cells);
+  resetLeaderboardPresence();
+  serverLeaderboard = leaderboardPayload;
+  clearCachedCityStats();
+  clearCleanPreview();
+  resetTimeline(cells);
+
+  renderCells(cells);
+  updateStats(cells);
+  centerOnFirstRecordedCell(cells);
+}
+
+async function ensureLocalDatabaseForEditing() {
+  if (currentDb) return true;
+
+  if (!currentDbBytes) {
+    setStatus("Charge une DB avant d'éditer.");
+    return false;
+  }
+
+  await ensureSqlReady();
+
+  try {
+    const nextDb = new SQL.Database(currentDbBytes);
+    assertV4Schema(nextDb);
+    currentDb = nextDb;
+    return true;
+  } catch (error) {
+    console.error(error);
+    setStatus(`Impossible d'ouvrir la DB localement pour éditer : ${error.message}`);
+    return false;
   }
 }
 
@@ -1067,9 +1280,8 @@ function refreshFromCurrentDatabase() {
   updateStats(cells);
 }
 
-function runEditModeAt(latlng) {
-  if (!currentDb) {
-    setStatus("Charge une DB avant d'éditer.");
+async function runEditModeAt(latlng) {
+  if (!(await ensureLocalDatabaseForEditing())) {
     return;
   }
 
@@ -1192,13 +1404,17 @@ function deleteCell(cell) {
   }
 }
 
-function handleCleanButtonClick(threshold) {
+async function handleCleanButtonClick(threshold) {
   const normalizedThreshold = normalizeCleanThreshold(threshold);
   if (
     cleanPreview &&
     cleanPreview.threshold === normalizedThreshold &&
     cleanPreview.cells.length > 0
   ) {
+    if (!(await ensureLocalDatabaseForEditing())) {
+      return;
+    }
+
     cleanSmallComponents(cleanPreview.threshold, cleanPreview.cells);
     return;
   }
@@ -1207,7 +1423,7 @@ function handleCleanButtonClick(threshold) {
 }
 
 function previewSmallComponents(threshold) {
-  if (!currentDb) {
+  if (!currentCells.length) {
     setStatus("Charge une DB avant de nettoyer.");
     return;
   }
@@ -1533,373 +1749,68 @@ function exportCurrentDatabase() {
 function showLeaderboard() {
   renderLeaderboard();
   leaderboardDialog.classList.remove("is-hidden");
-  if (!leaderboardScanComplete) {
-    scanLeaderboardCities().catch((error) => {
-      console.error(error);
-      leaderboardScanRunning = false;
-      updateLeaderboardIdleTitle();
-      leaderboardEmpty.textContent = "Impossible de construire la liste.";
-      renderLeaderboard();
-      setStatus(`Erreur leaderboard : ${error.message}`);
-    });
-  }
 }
 
 function hideLeaderboard() {
-  leaderboardScanId += 1;
-  leaderboardScanRunning = false;
   leaderboardTitle.textContent = "Villes";
   leaderboardDialog.classList.add("is-hidden");
 }
 
 function renderLeaderboard() {
-  const cities = Array.from(leaderboardPresentCityKeys)
-    .map((key) => cityBoundaryCache.items[key])
-    .filter((boundary) => boundary && boundary.geoJson && isAllowedCityBoundary(boundary))
-    .sort((first, second) => {
-      const firstName = first.name || "";
-      const secondName = second.name || "";
-      return firstName.localeCompare(secondName, "fr", { sensitivity: "base" });
-    });
+  if (!serverLeaderboard) {
+    leaderboardTitle.textContent = "Villes";
+    leaderboardList.replaceChildren();
+    leaderboardEmpty.textContent = leaderboardLoading
+      ? "Leaderboard en préparation..."
+      : "Leaderboard serveur indisponible.";
+    leaderboardEmpty.classList.remove("is-hidden");
+    return;
+  }
 
+  const cities = Array.isArray(serverLeaderboard.cities) ? serverLeaderboard.cities : [];
   leaderboardList.replaceChildren();
   leaderboardEmpty.classList.toggle("is-hidden", cities.length > 0);
+  if (serverLeaderboard.pending || leaderboardLoading) {
+    leaderboardEmpty.textContent = "Leaderboard en préparation...";
+  } else if (serverLeaderboard.complete) {
+    leaderboardEmpty.textContent = "Aucune ville visitée.";
+  } else {
+    leaderboardEmpty.textContent = `Leaderboard partiel : ${formatNumber(serverLeaderboard.unresolvedCells || 0)} cellule(s) sans ville.`;
+  }
 
   for (const city of cities) {
     const item = document.createElement("li");
     const name = document.createElement("span");
     const total = document.createElement("strong");
+    const visited = Number(city.visited || 0);
+    const totalCellsInCity = Number(city.total || 0);
 
-    item.dataset.cityKey = city.key;
+    item.dataset.cityKey = city.key || "";
     name.textContent = city.name || "Ville";
-    total.textContent = Number.isFinite(city.totalGridCells)
-      ? `0/${formatNumber(city.totalGridCells)}`
-      : "0/...";
+    total.textContent = `${formatNumber(visited)}/${formatNumber(totalCellsInCity)}`;
+    if (Number.isFinite(city.percent)) {
+      total.title = `${city.percent.toLocaleString("fr-FR", {
+        minimumFractionDigits: 3,
+        maximumFractionDigits: 3
+      })} %`;
+    }
     item.append(name, total);
     leaderboardList.append(item);
-
-    if (!leaderboardTotalCalculatedKeys.has(city.key)) {
-      enqueueLeaderboardTotal(city.key);
-    }
   }
+
+  const doneCities = Number.isFinite(serverLeaderboard.doneCities)
+    ? serverLeaderboard.doneCities
+    : cities.length;
+  const remainingCities = Number.isFinite(serverLeaderboard.remainingCities)
+    ? serverLeaderboard.remainingCities
+    : 0;
+  leaderboardTitle.textContent = `Villes · ${formatNumber(doneCities)} faites / ${formatNumber(remainingCities)} cases à traiter`;
 }
 
 function resetLeaderboardPresence() {
-  leaderboardPresentCityKeys = new Set();
-  leaderboardScanId += 1;
-  leaderboardScanComplete = false;
-  leaderboardScanRunning = false;
-  resetLeaderboardTotalQueue();
-}
-
-function resetLeaderboardTotalQueue() {
-  leaderboardTotalQueue = [];
-  leaderboardTotalQueuedKeys = new Set();
-  leaderboardTotalInFlightKey = null;
-  leaderboardTotalCalculatedKeys = new Set();
-}
-
-function enqueueLeaderboardTotal(cityKey) {
-  if (!cityKey || leaderboardTotalQueuedKeys.has(cityKey) || leaderboardTotalInFlightKey === cityKey) return;
-
-  leaderboardTotalQueue.push(cityKey);
-  leaderboardTotalQueuedKeys.add(cityKey);
-  processNextLeaderboardTotal();
-}
-
-async function processNextLeaderboardTotal() {
-  if (leaderboardTotalInFlightKey || leaderboardTotalQueue.length === 0) return;
-
-  const cityKey = leaderboardTotalQueue.shift();
-  leaderboardTotalQueuedKeys.delete(cityKey);
-  const boundary = cityBoundaryCache.items[cityKey];
-
-  if (!boundary || !boundary.geoJson || !isAllowedCityBoundary(boundary)) {
-    processNextLeaderboardTotal();
-    return;
-  }
-
-  leaderboardTotalInFlightKey = cityKey;
-  updateLeaderboardTotalRow(cityKey, "0/...");
-
-  try {
-    const totalGridCells = await countLeaderboardTotalInWorker(boundary.geoJson);
-    if (!Number.isFinite(totalGridCells)) return;
-
-    leaderboardTotalCalculatedKeys.add(cityKey);
-    boundary.totalGridCells = totalGridCells;
-    if (boundary.stats) {
-      boundary.stats.total = totalGridCells;
-      boundary.stats.percent = totalGridCells > 0
-        ? (100.0 * (boundary.stats.visited || 0)) / totalGridCells
-        : 0;
-    }
-    boundary.lastUsedAt = Date.now();
-    cityBoundaryCache.items[boundary.key] = boundary;
-    saveCityBoundaryCache();
-    updateLeaderboardTotalRow(cityKey, `0/${formatNumber(totalGridCells)}`);
-  } catch (error) {
-    console.error(error);
-    updateLeaderboardTotalRow(cityKey, "0/...");
-  } finally {
-    leaderboardTotalInFlightKey = null;
-    processNextLeaderboardTotal();
-    updateLeaderboardIdleTitle();
-  }
-}
-
-function countLeaderboardTotalInWorker(geoJson) {
-  if (!("Worker" in window)) {
-    return Promise.resolve(countGridCellsInsideGeoJson(geoJson));
-  }
-
-  const requestId = leaderboardTotalNextRequestId;
-  leaderboardTotalNextRequestId += 1;
-
-  return new Promise((resolve, reject) => {
-    let worker;
-
-    try {
-      worker = new Worker(LEADERBOARD_TOTAL_WORKER_URL);
-    } catch (error) {
-      resolve(countGridCellsInsideGeoJson(geoJson));
-      return;
-    }
-
-    worker.onmessage = (event) => {
-      const { requestId: responseRequestId, totalGridCells, error } = event.data || {};
-      if (responseRequestId !== requestId) return;
-
-      worker.terminate();
-      if (error) {
-        reject(new Error(error));
-        return;
-      }
-
-      resolve(totalGridCells);
-    };
-    worker.onerror = (event) => {
-      worker.terminate();
-      reject(new Error(event.message || "Erreur du worker leaderboard."));
-    };
-    worker.postMessage({ requestId, geoJson });
-  });
-}
-
-function updateLeaderboardTotalRow(cityKey, value) {
-  const row = Array.from(leaderboardList.children).find((item) => item.dataset.cityKey === cityKey);
-  if (!row) return;
-
-  const total = row.querySelector("strong");
-  if (total) {
-    total.textContent = value;
-  }
-}
-
-async function scanLeaderboardCities() {
-  leaderboardScanRunning = true;
-  updateLeaderboardScanTitle(0, 0);
-
-  if (!currentCells.length) {
-    leaderboardEmpty.textContent = "Aucune ville visitée.";
-    renderLeaderboard();
-    leaderboardScanComplete = true;
-    leaderboardScanRunning = false;
-    updateLeaderboardIdleTitle();
-    return;
-  }
-
-  const scanId = ++leaderboardScanId;
-  let cacheScanIndex = 0;
-  const missingCellIndexes = [];
-  const activeCells = currentCells.filter((cell) => cell.editState !== EDIT_STATE_REMOVED_BY_EDIT);
-  leaderboardEmpty.textContent = "Analyse des cellules...";
-  renderLeaderboard();
-  syncCityWorkerCells(currentCells);
-
-  while (scanId === leaderboardScanId) {
-    const result = await scanLeaderboardCachedBatchInWorker(cacheScanIndex);
-    if (scanId !== leaderboardScanId) return;
-
-    addLeaderboardBoundaryKeys(result.boundaryKeys);
-    missingCellIndexes.push(...result.missingCellIndexes);
-    cacheScanIndex = result.nextIndex;
-    updateLeaderboardScanTitle(result.processed, result.total);
-    renderLeaderboard();
-
-    if (result.done) {
-      break;
-    }
-  }
-
-  for (let missingIndex = 0; missingIndex < missingCellIndexes.length; missingIndex += 1) {
-    if (scanId !== leaderboardScanId) return;
-
-    const cellIndex = missingCellIndexes[missingIndex];
-    const center = cellToCenterLatLng(activeCells[cellIndex]);
-    const latlng = { lat: center.lat, lng: center.lng };
-    let boundary = null;
-
-    try {
-      boundary = await findCachedBoundaryContainingInWorker(latlng);
-    } catch (error) {
-      if (error && error.isCityWorkerRestart) {
-        boundary = findCachedBoundaryContaining(latlng);
-      } else {
-        throw error;
-      }
-    }
-
-    if (boundary && isAllowedCityBoundary(boundary)) {
-      leaderboardPresentCityKeys.add(boundary.key);
-      renderLeaderboard();
-      continue;
-    }
-
-    updateLeaderboardResolvingTitle(missingIndex, missingCellIndexes.length);
-    boundary = await fetchCityBoundaryForLeaderboard(latlng, scanId);
-    if (scanId !== leaderboardScanId) return;
-
-    if (
-      boundary &&
-      isAllowedCityBoundary(boundary) &&
-      isLatLngInsideGeoJson(latlng, boundary.geoJson)
-    ) {
-      leaderboardPresentCityKeys.add(boundary.key);
-      boundary.lastUsedAt = Date.now();
-      cityBoundaryCache.items[boundary.key] = boundary;
-      saveCityBoundaryCache();
-      renderLeaderboard();
-      continue;
-    }
-
-    if (boundary && isAllowedCityBoundary(boundary)) {
-      console.warn("Leaderboard : frontière ignorée car elle ne contient pas la cellule demandée.", boundary.name);
-    }
-  }
-
-  leaderboardScanComplete = true;
-  leaderboardScanRunning = false;
-  leaderboardEmpty.textContent = "Aucune ville visitée.";
-  renderLeaderboard();
-  updateLeaderboardIdleTitle();
-}
-
-function scanLeaderboardCachedBatchInWorker(startIndex) {
-  return postCityWorkerTask("scanLeaderboardCachedBatch", {
-    startIndex,
-    batchSize: 1000,
-    presentBoundaries: leaderboardBoundaryPayload(Array.from(leaderboardPresentCityKeys)),
-    cacheBoundaries: leaderboardBoundaryPayload(Object.keys(cityBoundaryCache.items))
-  });
-}
-
-function addLeaderboardBoundaryKeys(boundaryKeys) {
-  if (!Array.isArray(boundaryKeys)) return;
-
-  for (const key of boundaryKeys) {
-    if (cityBoundaryCache.items[key]) {
-      leaderboardPresentCityKeys.add(key);
-    }
-  }
-}
-
-function leaderboardBoundaryPayload(keys) {
-  return keys
-    .map((key) => cityBoundaryCache.items[key])
-    .filter((boundary) => boundary && boundary.key && boundary.geoJson && isAllowedCityBoundary(boundary))
-    .map((boundary) => ({
-      key: boundary.key,
-      geoJson: boundary.geoJson
-    }));
-}
-
-function updateLeaderboardScanTitle(processed, total, suffix = "") {
-  const progress = total > 0
-    ? `${formatNumber(processed)}/${formatNumber(total)}`
-    : "0/0";
-  leaderboardTitle.textContent = suffix
-    ? `Recherche des villes en cours... ${progress} (${suffix})`
-    : `Recherche des villes en cours... ${progress}`;
-}
-
-function updateLeaderboardResolvingTitle(resolved, total) {
-  const progress = total > 0
-    ? `${formatNumber(resolved)}/${formatNumber(total)}`
-    : "0/0";
-  leaderboardTitle.textContent = `Résolution des villes manquantes via Nominatim... ${progress} cellules`;
-}
-
-function updateLeaderboardIdleTitle() {
-  if (
-    leaderboardScanRunning ||
-    leaderboardTotalInFlightKey ||
-    leaderboardTotalQueue.length > 0 ||
-    leaderboardTotalQueuedKeys.size > 0
-  ) {
-    return;
-  }
-
-  leaderboardTitle.textContent = "Villes";
-}
-
-async function fetchCityBoundaryForLeaderboard(latlng, scanId) {
-  const slotWaitStartedAt = Date.now();
-
-  while (cityBoundaryRequestInFlight) {
-    if (scanId !== leaderboardScanId) return null;
-    if (Date.now() - slotWaitStartedAt >= LEADERBOARD_REQUEST_SLOT_TIMEOUT_MS) {
-      console.warn("Leaderboard : attente de requête ville trop longue, cellule ignorée.");
-      return null;
-    }
-    await sleep(250);
-  }
-
-  const delay = Math.max(
-    0,
-    CITY_BOUNDARY_MIN_REQUEST_INTERVAL_MS - (Date.now() - lastBoundaryRequestAt)
-  );
-
-  if (delay > 0) {
-    await sleep(delay);
-  }
-
-  if (scanId !== leaderboardScanId) return null;
-
-  cityBoundaryRequestInFlight = true;
-  lastBoundaryRequestAt = Date.now();
-
-  try {
-    return await fetchCityBoundaryWithTimeout(latlng, LEADERBOARD_FETCH_TIMEOUT_MS);
-  } catch (error) {
-    console.error(error);
-    return null;
-  } finally {
-    cityBoundaryRequestInFlight = false;
-  }
-}
-
-function sleep(durationMs) {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, durationMs);
-  });
-}
-
-function fetchCityBoundaryWithTimeout(latlng, timeoutMs) {
-  const controller = new AbortController();
-
-  return new Promise((resolve, reject) => {
-    const timeoutId = window.setTimeout(() => {
-      controller.abort();
-      reject(new Error("Recherche ville trop longue."));
-    }, timeoutMs);
-
-    fetchCityBoundary(latlng, { signal: controller.signal })
-      .then(resolve, reject)
-      .finally(() => {
-        window.clearTimeout(timeoutId);
-      });
-  });
+  closeLeaderboardStream();
+  serverLeaderboard = null;
+  leaderboardLoading = false;
 }
 
 function showSaveSummary() {
