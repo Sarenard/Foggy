@@ -84,6 +84,17 @@
       </section>
     </main>
 
+    <div id="leaderboardDialog" class="modal-backdrop is-hidden" role="dialog" aria-modal="true" aria-labelledby="leaderboardTitle">
+      <section class="modal-panel leaderboard-panel">
+        <header class="modal-header">
+          <h2 id="leaderboardTitle">Villes</h2>
+          <button id="leaderboardCloseButton" class="icon-button" type="button" aria-label="Fermer">×</button>
+        </header>
+        <ol id="leaderboardList" class="leaderboard-list" aria-label="Liste des villes visitées"></ol>
+        <p id="leaderboardEmpty" class="leaderboard-empty">Aucune ville visitée.</p>
+      </section>
+    </div>
+
     <div id="saveSummaryDialog" class="modal-backdrop is-hidden" role="dialog" aria-modal="true" aria-labelledby="saveSummaryTitle">
       <section class="modal-panel">
         <header class="modal-header">

@@ -2,10 +2,14 @@ const GRID_CELL_SIZE_METERS = 15.0;
 const WEB_MERCATOR_HALF_WORLD_METERS = 20037508.342789244;
 const WEB_MERCATOR_EARTH_RADIUS = 6378137.0;
 const DEFAULT_DB_URL = "../location_history.db";
+const CITY_WORKER_URL = "cityWorker.js";
+const LEADERBOARD_TOTAL_WORKER_URL = "leaderboardTotalWorker.js";
 const NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse";
 const CITY_BOUNDARY_CACHE_KEY = "foggy.visual.cityBoundaryCache.v1";
-const CITY_BOUNDARY_CACHE_LIMIT = 80;
+const CITY_BOUNDARY_CACHE_LIMIT = 1000;
 const CITY_BOUNDARY_MIN_REQUEST_INTERVAL_MS = 1200;
+const LEADERBOARD_FETCH_TIMEOUT_MS = 8000;
+const LEADERBOARD_REQUEST_SLOT_TIMEOUT_MS = 10000;
 
 const EDIT_STATE_NORMAL = 0;
 const EDIT_STATE_ADDED_BY_EDIT = 1;
@@ -70,7 +74,6 @@ let lastBoundaryRequestAt = 0;
 let cityBoundaryRequestInFlight = false;
 let currentBoundaryKey = null;
 let currentBoundary = null;
-let lastBounds = null;
 let cleanPreview = null;
 let cleanBlinkInterval = null;
 let cleanBlinkOn = false;
@@ -80,6 +83,20 @@ let timelineCurrentRecordedAt = null;
 let timelineAtEnd = true;
 let timelinePlayFrame = null;
 let timelineLastPlayAt = 0;
+let cityWorker = null;
+let cityWorkerNextRequestId = 1;
+let cityWorkerTasks = new Map();
+let cityBoundaryLookupId = 0;
+let cityStatsRequestId = 0;
+let leaderboardPresentCityKeys = new Set();
+let leaderboardScanId = 0;
+let leaderboardScanComplete = false;
+let leaderboardScanRunning = false;
+let leaderboardTotalQueue = [];
+let leaderboardTotalQueuedKeys = new Set();
+let leaderboardTotalInFlightKey = null;
+let leaderboardTotalNextRequestId = 1;
+let leaderboardTotalCalculatedKeys = new Set();
 
 const map = L.map("map", {
   preferCanvas: true,
@@ -139,6 +156,18 @@ editControl.onAdd = () => {
 };
 editControl.addTo(map);
 
+const leaderboardControl = L.control({ position: "topleft" });
+leaderboardControl.onAdd = () => {
+  const node = L.DomUtil.create("div", "legend leaderboard-control");
+  node.innerHTML = `
+    <button id="leaderboardButton" type="button" title="Liste des villes visitées">Leaderboard</button>
+  `;
+  L.DomEvent.disableClickPropagation(node);
+  L.DomEvent.disableScrollPropagation(node);
+  return node;
+};
+leaderboardControl.addTo(map);
+
 const dbFileInput = document.querySelector("#dbFileInput");
 const basemapSelect = document.querySelector("#basemapSelect");
 const loadDefaultButton = document.querySelector("#loadDefaultButton");
@@ -161,6 +190,12 @@ const editModeSelect = document.querySelector("#editModeSelect");
 const cleanThresholdInput = document.querySelector("#cleanThresholdInput");
 const cleanThresholdValue = document.querySelector("#cleanThresholdValue");
 const cleanButton = document.querySelector("#cleanButton");
+const leaderboardButton = document.querySelector("#leaderboardButton");
+const leaderboardDialog = document.querySelector("#leaderboardDialog");
+const leaderboardTitle = document.querySelector("#leaderboardTitle");
+const leaderboardCloseButton = document.querySelector("#leaderboardCloseButton");
+const leaderboardList = document.querySelector("#leaderboardList");
+const leaderboardEmpty = document.querySelector("#leaderboardEmpty");
 const saveDbButton = document.querySelector("#saveDbButton");
 const saveSummaryDialog = document.querySelector("#saveSummaryDialog");
 const saveSummaryCloseButton = document.querySelector("#saveSummaryCloseButton");
@@ -210,8 +245,16 @@ cleanButton.addEventListener("click", () => {
   }
 });
 
+leaderboardButton.addEventListener("click", () => {
+  showLeaderboard();
+});
+
 saveDbButton.addEventListener("click", () => {
   showSaveSummary();
+});
+
+leaderboardCloseButton.addEventListener("click", () => {
+  hideLeaderboard();
 });
 
 saveSummaryCloseButton.addEventListener("click", () => {
@@ -233,7 +276,18 @@ saveSummaryDialog.addEventListener("click", (event) => {
   }
 });
 
+leaderboardDialog.addEventListener("click", (event) => {
+  if (event.target === leaderboardDialog) {
+    hideLeaderboard();
+  }
+});
+
 window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !leaderboardDialog.classList.contains("is-hidden")) {
+    hideLeaderboard();
+    return;
+  }
+
   if (event.key === "Escape" && !saveSummaryDialog.classList.contains("is-hidden")) {
     hideSaveSummary();
   }
@@ -316,7 +370,22 @@ function setBasemap(name) {
 }
 
 async function resolveCityBoundaryAt(latlng) {
-  const cachedBoundary = findCachedBoundaryContaining(latlng);
+  restartCityWorkerForClick();
+  syncCityWorkerCells(currentCells);
+
+  const lookupId = ++cityBoundaryLookupId;
+  const plainLatLng = { lat: latlng.lat, lng: latlng.lng };
+  let cachedBoundary = null;
+
+  try {
+    cachedBoundary = await findCachedBoundaryContainingInWorker(plainLatLng);
+  } catch (error) {
+    if (error && error.isCityWorkerRestart) return;
+    throw error;
+  }
+
+  if (lookupId !== cityBoundaryLookupId) return;
+
   if (cachedBoundary) {
     cachedBoundary.lastUsedAt = Date.now();
     saveCityBoundaryCache();
@@ -343,7 +412,9 @@ async function resolveCityBoundaryAt(latlng) {
   lastBoundaryRequestAt = Date.now();
 
   try {
-    const boundary = await fetchCityBoundary(latlng);
+    const boundary = await fetchCityBoundary(plainLatLng);
+    if (lookupId !== cityBoundaryLookupId) return;
+
     if (boundary) {
       showCityBoundary(boundary);
     }
@@ -354,7 +425,7 @@ async function resolveCityBoundaryAt(latlng) {
   }
 }
 
-async function fetchCityBoundary(latlng) {
+async function fetchCityBoundary(latlng, options = {}) {
   const url = new URL(NOMINATIM_REVERSE_URL);
   url.searchParams.set("format", "jsonv2");
   url.searchParams.set("lat", latlng.lat.toString());
@@ -365,6 +436,7 @@ async function fetchCityBoundary(latlng) {
   url.searchParams.set("accept-language", "fr");
 
   const response = await fetch(url.toString(), {
+    signal: options.signal,
     headers: {
       Accept: "application/json"
     }
@@ -394,8 +466,7 @@ function boundaryFromNominatim(data) {
   if (!geoJson || !["Polygon", "MultiPolygon"].includes(geoJson.type)) return null;
 
   const address = data.address || {};
-  const countryCode = (address.country_code || "").toLowerCase();
-  if (countryCode && countryCode !== "fr") return null;
+  if (isNominatimCountryBoundary(data, address)) return null;
 
   const name =
     address.city ||
@@ -411,9 +482,30 @@ function boundaryFromNominatim(data) {
   return {
     key,
     name,
+    boundaryType: data.addresstype || data.type || "",
+    countryCode: (address.country_code || "").toLowerCase(),
+    hasLocalBoundaryName: Boolean(address.city || address.town || address.village || address.municipality || address.county),
     geoJson,
     lastUsedAt: Date.now()
   };
+}
+
+function isNominatimCountryBoundary(data, address) {
+  const isLowRankAdministrativeBoundary =
+    data.type === "administrative" &&
+    data.category === "boundary" &&
+    Number(data.place_rank) <= 4;
+  const hasOnlyCountryAddress =
+    address.country &&
+    !address.city &&
+    !address.town &&
+    !address.village &&
+    !address.municipality &&
+    !address.county;
+
+  return data.addresstype === "country" ||
+    isLowRankAdministrativeBoundary ||
+    Boolean(hasOnlyCountryAddress);
 }
 
 function showCityBoundary(boundary) {
@@ -425,29 +517,110 @@ function showCityBoundary(boundary) {
   cityBoundaryLayer.bringToFront();
   currentBoundary = boundary;
   updateCityStats(boundary);
-  ensureCityTotalCellCount(boundary);
   setStatus(`Frontière : ${boundary.name}.`);
 }
 
-function ensureCityTotalCellCount(boundary) {
-  if (Number.isFinite(boundary.totalGridCells)) {
-    updateCityTotalAndPercent(boundary);
-    return;
+async function findCachedBoundaryContainingInWorker(latlng) {
+  const boundaries = Object.values(cityBoundaryCache.items)
+    .filter((boundary) => boundary && boundary.key && boundary.geoJson && isAllowedCityBoundary(boundary))
+    .map((boundary) => ({
+      key: boundary.key,
+      geoJson: boundary.geoJson
+    }));
+
+  if (boundaries.length === 0) return null;
+
+  try {
+    const { boundaryKey } = await postCityWorkerTask("findBoundaryContaining", {
+      latlng,
+      boundaries
+    });
+
+    return boundaryKey ? cityBoundaryCache.items[boundaryKey] || null : null;
+  } catch (error) {
+    if (error && error.isCityWorkerRestart) throw error;
+
+    console.warn("Worker ville indisponible, calcul de cache sur le thread principal.", error);
+    return findCachedBoundaryContaining(latlng);
+  }
+}
+
+function getCityWorker() {
+  if (!("Worker" in window)) return null;
+  if (cityWorker) return cityWorker;
+
+  try {
+    cityWorker = new Worker(CITY_WORKER_URL);
+  } catch (error) {
+    console.warn("Worker ville indisponible.", error);
+    cityWorker = null;
+    return null;
   }
 
-  cityTotalCells.textContent = "...";
-  cityPercent.textContent = "...";
-  window.setTimeout(() => {
-    const totalGridCells = countGridCellsInsideGeoJson(boundary.geoJson);
-    boundary.totalGridCells = totalGridCells;
-    boundary.lastUsedAt = Date.now();
-    cityBoundaryCache.items[boundary.key] = boundary;
-    saveCityBoundaryCache();
+  cityWorker.onmessage = (event) => {
+    const { requestId, result, error } = event.data || {};
+    const task = cityWorkerTasks.get(requestId);
+    if (!task) return;
 
-    if (currentBoundary && currentBoundary.key === boundary.key) {
-      updateCityTotalAndPercent(boundary);
+    cityWorkerTasks.delete(requestId);
+    if (error) {
+      task.reject(new Error(error));
+      return;
     }
-  }, 0);
+
+    task.resolve(result);
+  };
+  cityWorker.onerror = (event) => {
+    const error = new Error(event.message || "Erreur du worker ville.");
+    terminateCityWorker(error);
+  };
+
+  return cityWorker;
+}
+
+function restartCityWorkerForClick() {
+  if (!cityWorker || cityWorkerTasks.size === 0) return;
+
+  const error = new Error("Worker ville relancé pour un nouveau clic.");
+  error.isCityWorkerRestart = true;
+  terminateCityWorker(error);
+}
+
+function terminateCityWorker(error) {
+  const worker = cityWorker;
+  cityWorker = null;
+
+  for (const task of cityWorkerTasks.values()) {
+    task.reject(error);
+  }
+
+  cityWorkerTasks.clear();
+
+  if (worker) {
+    worker.terminate();
+  }
+}
+
+function postCityWorkerTask(type, payload) {
+  const worker = getCityWorker();
+  if (!worker) {
+    return Promise.reject(new Error("Web Worker indisponible."));
+  }
+
+  const requestId = cityWorkerNextRequestId;
+  cityWorkerNextRequestId += 1;
+
+  return new Promise((resolve, reject) => {
+    cityWorkerTasks.set(requestId, { resolve, reject });
+    worker.postMessage({ requestId, type, payload });
+  });
+}
+
+function syncCityWorkerCells(cells) {
+  postCityWorkerTask("setCells", { cells }).catch((error) => {
+    if (error && error.isCityWorkerRestart) return;
+    console.warn("Impossible de synchroniser les cellules dans le worker ville.", error);
+  });
 }
 
 function loadCityBoundaryCache() {
@@ -456,10 +629,31 @@ function loadCityBoundaryCache() {
     if (!rawCache) return { items: {} };
     const parsedCache = JSON.parse(rawCache);
     if (!parsedCache || typeof parsedCache.items !== "object") return { items: {} };
-    return parsedCache;
+    return pruneCityBoundaryCache(parsedCache);
   } catch (_error) {
     return { items: {} };
   }
+}
+
+function pruneCityBoundaryCache(cache) {
+  let changed = false;
+
+  for (const [key, boundary] of Object.entries(cache.items)) {
+    if (!isAllowedCityBoundary(boundary)) {
+      delete cache.items[key];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    try {
+      window.localStorage.setItem(CITY_BOUNDARY_CACHE_KEY, JSON.stringify(cache));
+    } catch (_error) {
+      // The visualizer still works if browser storage is unavailable or full.
+    }
+  }
+
+  return cache;
 }
 
 function saveCityBoundaryCache() {
@@ -482,14 +676,64 @@ function trimCityBoundaryCache() {
     });
 }
 
+function clearCachedCityStats() {
+  let changed = false;
+
+  for (const boundary of Object.values(cityBoundaryCache.items)) {
+    if (boundary && boundary.stats) {
+      delete boundary.stats;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveCityBoundaryCache();
+  }
+}
+
+function invalidateCachedCityStatsForCells(cells) {
+  if (!Array.isArray(cells) || cells.length === 0) return;
+
+  let changed = false;
+  const centers = cells.map(cellToCenterLatLng);
+
+  for (const boundary of Object.values(cityBoundaryCache.items)) {
+    if (!boundary || !boundary.stats || !boundary.geoJson || !isAllowedCityBoundary(boundary)) continue;
+
+    const containsChangedCell = centers.some((center) => isLatLngInsideGeoJson(center, boundary.geoJson));
+    if (!containsChangedCell) continue;
+
+    delete boundary.stats;
+    changed = true;
+  }
+
+  if (changed) {
+    saveCityBoundaryCache();
+  }
+}
+
 function findCachedBoundaryContaining(latlng) {
   for (const boundary of Object.values(cityBoundaryCache.items)) {
-    if (boundary && boundary.geoJson && isLatLngInsideGeoJson(latlng, boundary.geoJson)) {
+    if (
+      boundary &&
+      boundary.geoJson &&
+      isAllowedCityBoundary(boundary) &&
+      isLatLngInsideGeoJson(latlng, boundary.geoJson)
+    ) {
       return boundary;
     }
   }
 
   return null;
+}
+
+function isAllowedCityBoundary(boundary) {
+  if (!boundary) return false;
+  const name = normalizedBoundaryName(boundary && boundary.name ? boundary.name : "");
+  if (boundary.boundaryType === "country") return false;
+  if (boundary.hasLocalBoundaryName === false) return false;
+  if (name === "france" || name === "republique francaise") return false;
+  return true;
 }
 
 function isLatLngInsideGeoJson(latlng, geoJson) {
@@ -798,6 +1042,8 @@ function loadDatabase(bytes, label) {
     currentDbLabel = label || "location_history.db";
     dbDirty = false;
     loadedCellsByKey = mapCellsByKey(cells);
+    resetLeaderboardPresence();
+    clearCachedCityStats();
     clearCleanPreview();
     resetTimeline(cells);
 
@@ -849,6 +1095,8 @@ function runEditModeAt(latlng) {
   }
 
   dbDirty = true;
+  resetLeaderboardPresence();
+  invalidateCachedCityStatsForCells(targetCells);
   refreshFromCurrentDatabase();
   setStatus(`${editModeLabel(currentMode)} : ${formatNumber(targetCells.length)} case(s) traitée(s). Sauvegarde la DB pour persister.`);
 }
@@ -1000,6 +1248,8 @@ function cleanSmallComponents(threshold, cellsToDelete = getCleanCandidateCells(
   }
 
   dbDirty = true;
+  resetLeaderboardPresence();
+  invalidateCachedCityStatsForCells(cellsToDelete);
   clearCleanPreview();
   refreshFromCurrentDatabase();
   setStatus(`Clean < ${threshold} : ${formatNumber(cellsToDelete.length)} case(s) nettoyée(s). Sauvegarde la DB pour persister.`);
@@ -1280,6 +1530,378 @@ function exportCurrentDatabase() {
   setStatus("DB exportée.");
 }
 
+function showLeaderboard() {
+  renderLeaderboard();
+  leaderboardDialog.classList.remove("is-hidden");
+  if (!leaderboardScanComplete) {
+    scanLeaderboardCities().catch((error) => {
+      console.error(error);
+      leaderboardScanRunning = false;
+      updateLeaderboardIdleTitle();
+      leaderboardEmpty.textContent = "Impossible de construire la liste.";
+      renderLeaderboard();
+      setStatus(`Erreur leaderboard : ${error.message}`);
+    });
+  }
+}
+
+function hideLeaderboard() {
+  leaderboardScanId += 1;
+  leaderboardScanRunning = false;
+  leaderboardTitle.textContent = "Villes";
+  leaderboardDialog.classList.add("is-hidden");
+}
+
+function renderLeaderboard() {
+  const cities = Array.from(leaderboardPresentCityKeys)
+    .map((key) => cityBoundaryCache.items[key])
+    .filter((boundary) => boundary && boundary.geoJson && isAllowedCityBoundary(boundary))
+    .sort((first, second) => {
+      const firstName = first.name || "";
+      const secondName = second.name || "";
+      return firstName.localeCompare(secondName, "fr", { sensitivity: "base" });
+    });
+
+  leaderboardList.replaceChildren();
+  leaderboardEmpty.classList.toggle("is-hidden", cities.length > 0);
+
+  for (const city of cities) {
+    const item = document.createElement("li");
+    const name = document.createElement("span");
+    const total = document.createElement("strong");
+
+    item.dataset.cityKey = city.key;
+    name.textContent = city.name || "Ville";
+    total.textContent = Number.isFinite(city.totalGridCells)
+      ? `0/${formatNumber(city.totalGridCells)}`
+      : "0/...";
+    item.append(name, total);
+    leaderboardList.append(item);
+
+    if (!leaderboardTotalCalculatedKeys.has(city.key)) {
+      enqueueLeaderboardTotal(city.key);
+    }
+  }
+}
+
+function resetLeaderboardPresence() {
+  leaderboardPresentCityKeys = new Set();
+  leaderboardScanId += 1;
+  leaderboardScanComplete = false;
+  leaderboardScanRunning = false;
+  resetLeaderboardTotalQueue();
+}
+
+function resetLeaderboardTotalQueue() {
+  leaderboardTotalQueue = [];
+  leaderboardTotalQueuedKeys = new Set();
+  leaderboardTotalInFlightKey = null;
+  leaderboardTotalCalculatedKeys = new Set();
+}
+
+function enqueueLeaderboardTotal(cityKey) {
+  if (!cityKey || leaderboardTotalQueuedKeys.has(cityKey) || leaderboardTotalInFlightKey === cityKey) return;
+
+  leaderboardTotalQueue.push(cityKey);
+  leaderboardTotalQueuedKeys.add(cityKey);
+  processNextLeaderboardTotal();
+}
+
+async function processNextLeaderboardTotal() {
+  if (leaderboardTotalInFlightKey || leaderboardTotalQueue.length === 0) return;
+
+  const cityKey = leaderboardTotalQueue.shift();
+  leaderboardTotalQueuedKeys.delete(cityKey);
+  const boundary = cityBoundaryCache.items[cityKey];
+
+  if (!boundary || !boundary.geoJson || !isAllowedCityBoundary(boundary)) {
+    processNextLeaderboardTotal();
+    return;
+  }
+
+  leaderboardTotalInFlightKey = cityKey;
+  updateLeaderboardTotalRow(cityKey, "0/...");
+
+  try {
+    const totalGridCells = await countLeaderboardTotalInWorker(boundary.geoJson);
+    if (!Number.isFinite(totalGridCells)) return;
+
+    leaderboardTotalCalculatedKeys.add(cityKey);
+    boundary.totalGridCells = totalGridCells;
+    if (boundary.stats) {
+      boundary.stats.total = totalGridCells;
+      boundary.stats.percent = totalGridCells > 0
+        ? (100.0 * (boundary.stats.visited || 0)) / totalGridCells
+        : 0;
+    }
+    boundary.lastUsedAt = Date.now();
+    cityBoundaryCache.items[boundary.key] = boundary;
+    saveCityBoundaryCache();
+    updateLeaderboardTotalRow(cityKey, `0/${formatNumber(totalGridCells)}`);
+  } catch (error) {
+    console.error(error);
+    updateLeaderboardTotalRow(cityKey, "0/...");
+  } finally {
+    leaderboardTotalInFlightKey = null;
+    processNextLeaderboardTotal();
+    updateLeaderboardIdleTitle();
+  }
+}
+
+function countLeaderboardTotalInWorker(geoJson) {
+  if (!("Worker" in window)) {
+    return Promise.resolve(countGridCellsInsideGeoJson(geoJson));
+  }
+
+  const requestId = leaderboardTotalNextRequestId;
+  leaderboardTotalNextRequestId += 1;
+
+  return new Promise((resolve, reject) => {
+    let worker;
+
+    try {
+      worker = new Worker(LEADERBOARD_TOTAL_WORKER_URL);
+    } catch (error) {
+      resolve(countGridCellsInsideGeoJson(geoJson));
+      return;
+    }
+
+    worker.onmessage = (event) => {
+      const { requestId: responseRequestId, totalGridCells, error } = event.data || {};
+      if (responseRequestId !== requestId) return;
+
+      worker.terminate();
+      if (error) {
+        reject(new Error(error));
+        return;
+      }
+
+      resolve(totalGridCells);
+    };
+    worker.onerror = (event) => {
+      worker.terminate();
+      reject(new Error(event.message || "Erreur du worker leaderboard."));
+    };
+    worker.postMessage({ requestId, geoJson });
+  });
+}
+
+function updateLeaderboardTotalRow(cityKey, value) {
+  const row = Array.from(leaderboardList.children).find((item) => item.dataset.cityKey === cityKey);
+  if (!row) return;
+
+  const total = row.querySelector("strong");
+  if (total) {
+    total.textContent = value;
+  }
+}
+
+async function scanLeaderboardCities() {
+  leaderboardScanRunning = true;
+  updateLeaderboardScanTitle(0, 0);
+
+  if (!currentCells.length) {
+    leaderboardEmpty.textContent = "Aucune ville visitée.";
+    renderLeaderboard();
+    leaderboardScanComplete = true;
+    leaderboardScanRunning = false;
+    updateLeaderboardIdleTitle();
+    return;
+  }
+
+  const scanId = ++leaderboardScanId;
+  let cacheScanIndex = 0;
+  const missingCellIndexes = [];
+  const activeCells = currentCells.filter((cell) => cell.editState !== EDIT_STATE_REMOVED_BY_EDIT);
+  leaderboardEmpty.textContent = "Analyse des cellules...";
+  renderLeaderboard();
+  syncCityWorkerCells(currentCells);
+
+  while (scanId === leaderboardScanId) {
+    const result = await scanLeaderboardCachedBatchInWorker(cacheScanIndex);
+    if (scanId !== leaderboardScanId) return;
+
+    addLeaderboardBoundaryKeys(result.boundaryKeys);
+    missingCellIndexes.push(...result.missingCellIndexes);
+    cacheScanIndex = result.nextIndex;
+    updateLeaderboardScanTitle(result.processed, result.total);
+    renderLeaderboard();
+
+    if (result.done) {
+      break;
+    }
+  }
+
+  for (let missingIndex = 0; missingIndex < missingCellIndexes.length; missingIndex += 1) {
+    if (scanId !== leaderboardScanId) return;
+
+    const cellIndex = missingCellIndexes[missingIndex];
+    const center = cellToCenterLatLng(activeCells[cellIndex]);
+    const latlng = { lat: center.lat, lng: center.lng };
+    let boundary = null;
+
+    try {
+      boundary = await findCachedBoundaryContainingInWorker(latlng);
+    } catch (error) {
+      if (error && error.isCityWorkerRestart) {
+        boundary = findCachedBoundaryContaining(latlng);
+      } else {
+        throw error;
+      }
+    }
+
+    if (boundary && isAllowedCityBoundary(boundary)) {
+      leaderboardPresentCityKeys.add(boundary.key);
+      renderLeaderboard();
+      continue;
+    }
+
+    updateLeaderboardResolvingTitle(missingIndex, missingCellIndexes.length);
+    boundary = await fetchCityBoundaryForLeaderboard(latlng, scanId);
+    if (scanId !== leaderboardScanId) return;
+
+    if (
+      boundary &&
+      isAllowedCityBoundary(boundary) &&
+      isLatLngInsideGeoJson(latlng, boundary.geoJson)
+    ) {
+      leaderboardPresentCityKeys.add(boundary.key);
+      boundary.lastUsedAt = Date.now();
+      cityBoundaryCache.items[boundary.key] = boundary;
+      saveCityBoundaryCache();
+      renderLeaderboard();
+      continue;
+    }
+
+    if (boundary && isAllowedCityBoundary(boundary)) {
+      console.warn("Leaderboard : frontière ignorée car elle ne contient pas la cellule demandée.", boundary.name);
+    }
+  }
+
+  leaderboardScanComplete = true;
+  leaderboardScanRunning = false;
+  leaderboardEmpty.textContent = "Aucune ville visitée.";
+  renderLeaderboard();
+  updateLeaderboardIdleTitle();
+}
+
+function scanLeaderboardCachedBatchInWorker(startIndex) {
+  return postCityWorkerTask("scanLeaderboardCachedBatch", {
+    startIndex,
+    batchSize: 1000,
+    presentBoundaries: leaderboardBoundaryPayload(Array.from(leaderboardPresentCityKeys)),
+    cacheBoundaries: leaderboardBoundaryPayload(Object.keys(cityBoundaryCache.items))
+  });
+}
+
+function addLeaderboardBoundaryKeys(boundaryKeys) {
+  if (!Array.isArray(boundaryKeys)) return;
+
+  for (const key of boundaryKeys) {
+    if (cityBoundaryCache.items[key]) {
+      leaderboardPresentCityKeys.add(key);
+    }
+  }
+}
+
+function leaderboardBoundaryPayload(keys) {
+  return keys
+    .map((key) => cityBoundaryCache.items[key])
+    .filter((boundary) => boundary && boundary.key && boundary.geoJson && isAllowedCityBoundary(boundary))
+    .map((boundary) => ({
+      key: boundary.key,
+      geoJson: boundary.geoJson
+    }));
+}
+
+function updateLeaderboardScanTitle(processed, total, suffix = "") {
+  const progress = total > 0
+    ? `${formatNumber(processed)}/${formatNumber(total)}`
+    : "0/0";
+  leaderboardTitle.textContent = suffix
+    ? `Recherche des villes en cours... ${progress} (${suffix})`
+    : `Recherche des villes en cours... ${progress}`;
+}
+
+function updateLeaderboardResolvingTitle(resolved, total) {
+  const progress = total > 0
+    ? `${formatNumber(resolved)}/${formatNumber(total)}`
+    : "0/0";
+  leaderboardTitle.textContent = `Résolution des villes manquantes via Nominatim... ${progress} cellules`;
+}
+
+function updateLeaderboardIdleTitle() {
+  if (
+    leaderboardScanRunning ||
+    leaderboardTotalInFlightKey ||
+    leaderboardTotalQueue.length > 0 ||
+    leaderboardTotalQueuedKeys.size > 0
+  ) {
+    return;
+  }
+
+  leaderboardTitle.textContent = "Villes";
+}
+
+async function fetchCityBoundaryForLeaderboard(latlng, scanId) {
+  const slotWaitStartedAt = Date.now();
+
+  while (cityBoundaryRequestInFlight) {
+    if (scanId !== leaderboardScanId) return null;
+    if (Date.now() - slotWaitStartedAt >= LEADERBOARD_REQUEST_SLOT_TIMEOUT_MS) {
+      console.warn("Leaderboard : attente de requête ville trop longue, cellule ignorée.");
+      return null;
+    }
+    await sleep(250);
+  }
+
+  const delay = Math.max(
+    0,
+    CITY_BOUNDARY_MIN_REQUEST_INTERVAL_MS - (Date.now() - lastBoundaryRequestAt)
+  );
+
+  if (delay > 0) {
+    await sleep(delay);
+  }
+
+  if (scanId !== leaderboardScanId) return null;
+
+  cityBoundaryRequestInFlight = true;
+  lastBoundaryRequestAt = Date.now();
+
+  try {
+    return await fetchCityBoundaryWithTimeout(latlng, LEADERBOARD_FETCH_TIMEOUT_MS);
+  } catch (error) {
+    console.error(error);
+    return null;
+  } finally {
+    cityBoundaryRequestInFlight = false;
+  }
+}
+
+function sleep(durationMs) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, durationMs);
+  });
+}
+
+function fetchCityBoundaryWithTimeout(latlng, timeoutMs) {
+  const controller = new AbortController();
+
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      controller.abort();
+      reject(new Error("Recherche ville trop longue."));
+    }, timeoutMs);
+
+    fetchCityBoundary(latlng, { signal: controller.signal })
+      .then(resolve, reject)
+      .finally(() => {
+        window.clearTimeout(timeoutId);
+      });
+  });
+}
+
 function showSaveSummary() {
   if (!currentDb) {
     setStatus("Aucune DB à sauvegarder.");
@@ -1423,22 +2045,14 @@ function readCells(db) {
 
 function renderCells(cells) {
   currentCells = cells;
-  lastBounds = null;
+  syncCityWorkerCells(cells);
   cellsByKey = new Map();
 
-  const bounds = [];
-
   for (const cell of cells) {
-    const polygonBounds = cellToLatLngBounds(cell);
-    bounds.push(polygonBounds.getSouthWest(), polygonBounds.getNorthEast());
     cellsByKey.set(cellKey(cell.column, cell.row), cell);
   }
 
   applyTimelineFilter();
-
-  if (bounds.length > 0) {
-    lastBounds = L.latLngBounds(bounds);
-  }
 
   if (currentBoundary) {
     updateCityStats(currentBoundary);
@@ -1510,18 +2124,6 @@ function plainStatusForCell(cell) {
   return `${status} : colonne ${cell.column}, ligne ${cell.row}, ${date}.`;
 }
 
-function fitToCells() {
-  if (!lastBounds || !lastBounds.isValid()) {
-    setStatus("Aucune cellule à cadrer.");
-    return;
-  }
-
-  map.fitBounds(lastBounds.pad(0.08), {
-    maxZoom: 19,
-    animate: true
-  });
-}
-
 function centerOnFirstRecordedCell(cells) {
   if (cells.length === 0) {
     setStatus("Aucune cellule à centrer.");
@@ -1555,6 +2157,58 @@ function updateStats(cells) {
 }
 
 function updateCityStats(boundary) {
+  const requestId = ++cityStatsRequestId;
+  cityStatsTitle.textContent = `Ville de ${boundary.name}`;
+  cityStats.classList.remove("is-hidden");
+
+  if (isValidCachedCityStats(boundary.stats)) {
+    applyCityStats(boundary, boundary.stats);
+    return;
+  }
+
+  cityVisitedCells.textContent = "...";
+  cityVisitedCells.dataset.value = "0";
+  cityNormalCells.textContent = "...";
+  cityAddedCells.textContent = "...";
+  cityRemovedCells.textContent = "...";
+  cityTotalCells.textContent = "...";
+  cityPercent.textContent = "...";
+
+  postCityWorkerTask("countCellsInsideBoundary", { boundary })
+    .catch((error) => {
+      if (error && error.isCityWorkerRestart) return null;
+      return countCellsInsideBoundary(boundary);
+    })
+    .then(async (counts) => {
+      if (!counts) return null;
+      const totalGridCells = Number.isFinite(boundary.totalGridCells)
+        ? boundary.totalGridCells
+        : await countTotalGridCellsForBoundary(boundary);
+      if (!Number.isFinite(totalGridCells)) return null;
+      return buildCityStats(counts, totalGridCells);
+    })
+    .then((stats) => {
+      if (!stats) return;
+      if (requestId !== cityStatsRequestId) return;
+      boundary.stats = stats;
+      boundary.totalGridCells = stats.total;
+      boundary.lastUsedAt = Date.now();
+      cityBoundaryCache.items[boundary.key] = boundary;
+      saveCityBoundaryCache();
+      applyCityStats(boundary, stats);
+    });
+}
+
+function countTotalGridCellsForBoundary(boundary) {
+  return postCityWorkerTask("countGridCellsInsideGeoJson", { geoJson: boundary.geoJson })
+    .catch((error) => {
+      if (error && error.isCityWorkerRestart) return null;
+      return { totalGridCells: countGridCellsInsideGeoJson(boundary.geoJson) };
+    })
+    .then((result) => result ? result.totalGridCells : null);
+}
+
+function countCellsInsideBoundary(boundary) {
   const counts = new Map([
     [EDIT_STATE_NORMAL, 0],
     [EDIT_STATE_ADDED_BY_EDIT, 0],
@@ -1571,14 +2225,56 @@ function updateCityStats(boundary) {
   const added = counts.get(EDIT_STATE_ADDED_BY_EDIT) || 0;
   const removed = counts.get(EDIT_STATE_REMOVED_BY_EDIT) || 0;
 
+  return { normal, added, removed };
+}
+
+function applyCityStats(boundary, counts) {
+  const normal = counts.normal || counts.gps || 0;
+  const added = counts.added || 0;
+  const removed = counts.removed || 0;
+  const total = Number.isFinite(counts.total) ? counts.total : boundary.totalGridCells;
+  const visited = Number.isFinite(counts.visited) ? counts.visited : normal + added;
+
   cityStatsTitle.textContent = `Ville de ${boundary.name}`;
-  cityVisitedCells.textContent = formatNumber(normal + added);
-  cityVisitedCells.dataset.value = String(normal + added);
-  updateCityTotalAndPercent(boundary);
+  cityVisitedCells.textContent = formatNumber(visited);
+  cityVisitedCells.dataset.value = String(visited);
+  updateCityTotalAndPercent({ ...boundary, totalGridCells: total });
   cityNormalCells.textContent = formatNumber(normal);
   cityAddedCells.textContent = formatNumber(added);
   cityRemovedCells.textContent = formatNumber(removed);
   cityStats.classList.remove("is-hidden");
+}
+
+function buildCityStats(counts, totalGridCells) {
+  const normal = counts.normal || 0;
+  const added = counts.added || 0;
+  const removed = counts.removed || 0;
+  const total = Number.isFinite(totalGridCells) ? totalGridCells : 0;
+  const visited = normal + added;
+  const percent = total > 0 ? (100.0 * visited) / total : 0;
+
+  return {
+    gps: normal,
+    normal,
+    added,
+    removed,
+    visited,
+    total,
+    percent,
+    computedAt: Date.now()
+  };
+}
+
+function isValidCachedCityStats(stats) {
+  return Boolean(
+    stats &&
+    Number.isFinite(stats.normal) &&
+    Number.isFinite(stats.added) &&
+    Number.isFinite(stats.removed) &&
+    Number.isFinite(stats.visited) &&
+    Number.isFinite(stats.total) &&
+    Number.isFinite(stats.percent)
+  );
 }
 
 function updateCityTotalAndPercent(boundary) {

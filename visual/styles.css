@@ -557,6 +557,23 @@ button:focus-visible,
   color: #8a3300;
 }
 
+.leaderboard-control {
+  min-width: 132px;
+}
+
+.leaderboard-control button {
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #b9c2be;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 800;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -578,6 +595,12 @@ button:focus-visible,
   background: #fff;
   box-shadow: 0 24px 70px rgba(20, 29, 32, 0.28);
   color: var(--ink);
+}
+
+.leaderboard-panel {
+  width: min(760px, 100%);
+  max-height: min(760px, calc(100vh - 36px));
+  overflow: hidden;
 }
 
 .modal-header {
@@ -603,6 +626,50 @@ button:focus-visible,
   padding: 0;
   font-size: 1.35rem;
   line-height: 1;
+}
+
+.leaderboard-list {
+  display: grid;
+  gap: 8px;
+  max-height: min(620px, calc(100vh - 150px));
+  margin: 0;
+  padding: 14px 16px;
+  overflow: auto;
+  list-style: none;
+}
+
+.leaderboard-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8faf9;
+}
+
+.leaderboard-list span {
+  overflow: hidden;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.leaderboard-list strong {
+  font-weight: 860;
+}
+
+.leaderboard-empty {
+  margin: 0;
+  padding: 18px 16px;
+  color: var(--muted);
+  font-weight: 720;
+}
+
+.leaderboard-empty.is-hidden {
+  display: none;
 }
 
 .summary-grid {
